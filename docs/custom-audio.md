@@ -75,6 +75,22 @@ are inserted between their two source chunks automatically. When every
 slot is filled the status reports the plan complete, and further runs
 append past the plan as ordinary generations.
 
+In the Timeline's own strip the plan is a toolbar toggle, **chunk plan**,
+just left of **upscale**, filled purple while it owns the next run. While
+it is on the strip shows where each chunk goes:
+
+- **+ add** places the next root past the last one with a hole exactly one
+  undelivered bridge wide between them — the two roots visibly do *not*
+  run on from each other, because they are not continuous: the bridge
+  between them is still missing. A bridge take instead fills the first
+  hole on the strip, which is exactly its length.
+- The dash pill at a clip's end offers **next chunk**: it marks in purple
+  the exact span the next run generates — the next root's slot past the
+  last root, or the hole a bridge will fill. The band shows on the ruler
+  and across the waveform, and the hole itself is tinted.
+- **prepend** and **extend** go grey, because the plan owns the pin, and
+  the row under the strip names the next chunk instead of a pin.
+
 Keep the same reference image and a consistent prompt across the roots:
 they are independent generations, and the shared conditioning plus the
 bridge overlaps are what make them read as one continuous take.

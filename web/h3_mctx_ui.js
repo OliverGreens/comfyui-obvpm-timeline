@@ -2823,7 +2823,10 @@ app.registerExtension({
             }
             function durFrames(secs = durWidget?.value ?? 8, st = pinState()) {
                 const want = Math.max(1, Number(secs) || 0) * TL_FPS;
-                if (durMasks(st)) {
+                // the chunk plan cuts EVERY slot -- root and bridge --
+                // on the shared AV grid, so its length box snaps there
+                // too, pin or no pin
+                if (durMasks(st) || chunkPlanMode()) {
                     const lo = AV_BASE + Math.max(0, Math.floor(
                         (want - AV_BASE) / AV_STEP)) * AV_STEP;
                     return want <= AV_BASE ? AV_BASE
@@ -3282,6 +3285,274 @@ app.registerExtension({
             }
             paintRunMode();
 
+            // ---- chunk plan (toolbar, before upscale) -----------------
+            // Odd-first generation: the `chunk_plan` BOOLEAN. While it
+            // is on, Run walks chunkplan.py's schedule by itself -- the
+            // odd chunks (1, 3, 5...) are independent ROOT generations
+            // first, then the even chunks bridge the gaps one pass each
+            // -- and the manual pin row goes quiet. Same toolbar
+            // treatment as upscale: the widget hides, a fixed-label
+            // button carries the state in its fill. The fill is the
+            // PIN purple, not the upscale teal: the plan is a pin (it
+            // arms generation), and the strip's plan highlights wear
+            // this same purple.
+            const chunkPlanWidget = node.widgets?.find(
+                (w) => w.name === "chunk_plan");
+            if (chunkPlanWidget) {
+                chunkPlanWidget.hidden = true;
+                (chunkPlanWidget.options ??= {}).hidden = true;
+            }
+            const bridgeWindowWidget = node.widgets?.find(
+                (w) => w.name === "bridge_window");
+            function chunkPlanMode() {
+                const v = chunkPlanWidget?.value;
+                return v === true || v === "true" || v === "1";
+            }
+            const chunkPlanBtn = mkBtn("chunk plan", "");
+            // a landmark like upscale: same width, same row
+            chunkPlanBtn.style.minWidth = "90px";
+            function paintChunkPlan() {
+                const on = chunkPlanMode();
+                // themePalette(), not PAL: same TDZ reason as snapBtn
+                const P = themePalette();
+                chunkPlanBtn.style.background =
+                    on ? TL_ROLE.extend.bg : P.rest;
+                chunkPlanBtn.style.borderColor =
+                    on ? "transparent" : P.edge;
+                chunkPlanBtn.style.color = on ? "#fff" : P.text;
+                chunkPlanBtn.title = on
+                    ? "ON: Run follows the chunk plan -- the odd chunks "
+                      + "(1, 3, 5...) are generated first as independent "
+                      + "root takes, then the even chunks bridge the "
+                      + "gaps in one pass each, so every frame is "
+                      + "sampled exactly once. The plan owns the pin: "
+                      + "prepend/extend go quiet while it is on. Click "
+                      + "to generate the normal way."
+                    : "OFF: Run generates the next take from the pin "
+                      + "below. Click to plan the whole soundtrack "
+                      + "instead: roots first, bridges second.";
+            }
+            chunkPlanBtn.addEventListener("mouseenter", () => {
+                chunkPlanBtn.style.background = chunkPlanMode()
+                    ? TL_ROLE.extend.hover : "rgba(127,127,127,0.3)";
+            });
+            chunkPlanBtn.addEventListener("mouseleave", paintChunkPlan);
+            chunkPlanBtn.addEventListener("click", () => {
+                if (!chunkPlanWidget) return;
+                chunkPlanWidget.value = !chunkPlanMode();
+                // through the widget's own callback, like upscale
+                chunkPlanWidget.callback?.(chunkPlanWidget.value);
+            });
+            if (chunkPlanWidget) {
+                const prevCp = chunkPlanWidget.callback;
+                chunkPlanWidget.callback = function (...args) {
+                    const r = prevCp?.apply(this, args);
+                    // switching the plan off also drops its preview:
+                    // the purple band belongs to the plan, and a band
+                    // left over from a plan that no longer owns the next
+                    // run would describe a run that will not happen
+                    if (!chunkPlanMode()) planPreview = false;
+                    paintChunkPlan();
+                    node.setDirtyCanvas?.(true, true);
+                    // the strip describes the plan everywhere: badges,
+                    // toggles, the next-run row, the landing band
+                    try { void refresh(); } catch (err) { /* not yet */ }
+                    return r;
+                };
+            }
+            paintChunkPlan();
+
+            // ---- the plan, mirrored client-side ----------------------
+            // chunkplan.py stays authoritative at Run time; this mirror
+            // exists only to SHOW where the plan's next chunk lands:
+            // the hole "+ add" leaves between roots, the purple band on
+            // the ruler and the audio lane, the tinted hole. Same
+            // arithmetic, same shared AV grid (39 + 51k), same anchor
+            // rule -- the anchors Apply Pins saves in every take's
+            // sidecar. The UI cannot recompute the server's identity
+            // hash, so it matches an anchor to the current track by the
+            // track's own fields (the same match h3_timeline_audio.js
+            // uses to place the waveform); the server keeps its check.
+            let planPreview = false;   // armed by the seam popup's
+                                       // "next chunk"; sticky until the
+                                       // plan is switched off
+            let lastPlan = null;       // recomputed on every refresh
+            const planProbe = { key: "", frames: 0, pending: false };
+            function tlAvSnap(n) {
+                // nodes_masked.shared_av_snap_nearest: the shared AV
+                // grid is 39 + 51k; ties round up
+                if (n < AV_BASE) return AV_BASE;
+                const lo = AV_BASE
+                    + Math.floor((n - AV_BASE) / AV_STEP) * AV_STEP;
+                return (n - lo) * 2 < AV_STEP ? lo : lo + AV_STEP;
+            }
+            function tlAudioTrack() {
+                const w = node.widgets?.find(
+                    (x) => x.name === "audio_track");
+                try {
+                    const t = JSON.parse(String(w?.value || "").trim());
+                    return t && t.file ? t : null;
+                } catch (e2) { return null; }
+            }
+            function planAudioFrames(track) {
+                // chunkplan.audio_frames: the row's duration, else the
+                // file -- probed once per file and cached
+                if (Number(track.duration) > 0) {
+                    return Math.round(Number(track.duration) * TL_FPS);
+                }
+                if (planProbe.key !== track.file) {
+                    planProbe.key = track.file;
+                    planProbe.frames = 0;
+                    planProbe.pending = false;
+                }
+                if (planProbe.frames) return planProbe.frames;
+                if (!planProbe.pending) {
+                    planProbe.pending = true;
+                    api.fetchApi("/obvpm/h3/audio_info", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(track),
+                    }).then((r) => r.json()).then((j) => {
+                        if (j && Number(j.duration) > 0) {
+                            planProbe.frames = Math.round(
+                                Number(j.duration) * TL_FPS);
+                            void refresh();
+                        } else planProbe.pending = false;
+                    }, () => { planProbe.pending = false; });
+                }
+                return 0;
+            }
+            function tlAnchorRecord(meta, track) {
+                try {
+                    const saved = JSON.parse(
+                        meta?.timeline_audio || "null");
+                    if (!saved || !["file", "start_frame",
+                            "source_start", "duration"].every(
+                            (k) => saved.track?.[k] === track[k])) {
+                        return null;
+                    }
+                    const a = Number(saved.raw_start);
+                    return Number.isFinite(a) ? a : null;
+                } catch (e2) { return null; }
+            }
+            function chunkPlanCompute(entries, metas) {
+                const track = tlAudioTrack();
+                if (!track) {
+                    return { error: "add a soundtrack on the audio row." };
+                }
+                const W = Number(bridgeWindowWidget?.value ?? 39);
+                const secs = durSeconds();
+                if (secs == null) {
+                    return { error: "chunk length is wired; cannot "
+                                    + "preview the plan." };
+                }
+                if (!(Number(secs) > 0)) {
+                    return { error: "set a chunk length "
+                                    + "(duration_seconds)." };
+                }
+                const C = tlAvSnap(Math.max(1, Number(secs)) * TL_FPS);
+                if (C <= 2 * W) {
+                    return { error: "a " + C + "-frame chunk cannot hold "
+                        + "two " + W + "-frame bridge windows; raise the "
+                        + "chunk length or pick a smaller window." };
+                }
+                const audioLen = planAudioFrames(track);
+                if (!audioLen) return { pending: true };
+                const L = C, S = C + L - 2 * W;
+                const nOdd = audioLen <= C
+                    ? 1 : Math.ceil((audioLen - C) / S) + 1;
+                const filled = new Set();
+                const anchorOf = new Map();   // clip -> raw_start
+                entries.forEach((e, k) => {
+                    const a = tlAnchorRecord(metas[k], track);
+                    if (a == null) return;
+                    filled.add(a);
+                    if (e.clip) anchorOf.set(e.clip, a);
+                });
+                // chunkplan.plan: the earliest anchor is either a root
+                // (a multiple of the stride) or the first bridge; with
+                // nothing placed the plan starts at the timeline's end
+                let base;
+                if (filled.size) {
+                    const a = Math.min(...filled);
+                    base = a % S ? a - (C - W) : a;
+                } else {
+                    base = totalFrames;
+                }
+                const roots = [], bridges = [];
+                for (let j = 0; j < nOdd; j++) {
+                    roots.push({ index: 2 * j + 1, role: "root",
+                                 raw_start: base + j * S, frames: C });
+                }
+                for (let j = 0; j < nOdd - 1; j++) {
+                    bridges.push({ index: 2 * j + 2, role: "bridge",
+                                   raw_start: base + j * S + C - W,
+                                   frames: L, left: base + j * S,
+                                   right: base + (j + 1) * S });
+                }
+                const clipAt = new Map();     // raw_start -> clip
+                for (const [clip, a] of anchorOf) clipAt.set(a, clip);
+                let next = null;
+                for (const s of roots.concat(bridges)) {
+                    if (!filled.has(s.raw_start)) { next = s; break; }
+                }
+                const done = roots.concat(bridges)
+                    .filter((s) => filled.has(s.raw_start)).length;
+                return { C, W, L, S, nOdd, base, roots, bridges, filled,
+                         next, done, anchorOf, clipAt, gap: C - 2 * W,
+                         audioLen,
+                         total: roots.length + bridges.length };
+            }
+            function planLanding(p = lastPlan) {
+                // where the plan's next chunk sits ON THE TIMELINE, in
+                // timeline frames: a root lands past the last placed
+                // root with exactly one undelivered bridge (C - 2W) of
+                // hole between; a bridge lands in the hole between its
+                // two roots
+                if (!p || !p.next) return null;
+                const es = lastEntries;
+                if (p.next.role === "root") {
+                    const prev = p.roots
+                        .filter((s) => s.raw_start < p.next.raw_start)
+                        .sort((a, b) => b.raw_start - a.raw_start)[0];
+                    const pc = prev ? p.clipAt.get(prev.raw_start) : null;
+                    const pi = pc != null
+                        ? es.findIndex((e) => e.clip === pc) : -1;
+                    return { start: pi >= 0
+                                 ? cumStarts[pi] + playedArr[pi] + p.gap
+                                 : totalFrames,
+                             frames: p.C, gapIdx: -1, plan: true };
+                }
+                const lc = p.clipAt.get(p.next.left);
+                const rc = p.clipAt.get(p.next.right);
+                const li = lc != null
+                    ? es.findIndex((e) => e.clip === lc) : -1;
+                const ri = rc != null
+                    ? es.findIndex((e) => e.clip === rc) : -1;
+                if (li >= 0 && ri > li) {
+                    for (let k = li + 1; k < ri; k++) {
+                        if (es[k].gap != null) {
+                            return { start: cumStarts[k],
+                                     frames: playedArr[k], gapIdx: k,
+                                     gapFrames: playedArr[k],
+                                     plan: true };
+                        }
+                    }
+                    // roots butt-joined: the hole the bridge needs is
+                    // still exactly the gap, shown where it belongs
+                    return { start: cumStarts[li] + playedArr[li],
+                             frames: p.gap, gapIdx: -1, plan: true };
+                }
+                const gi = es.findIndex((e) => e.gap != null);
+                if (gi >= 0) {
+                    return { start: cumStarts[gi], frames: playedArr[gi],
+                             gapIdx: gi, gapFrames: playedArr[gi],
+                             plan: true };
+                }
+                return { start: totalFrames, frames: p.gap, gapIdx: -1,
+                         plan: true };
+            }
+
             // Whether the sequence is a RING, said where it can be seen.
             // The fact still lives in ONE place, the `loop` line of the
             // sequence text: the button reads it to paint and writes it
@@ -3343,7 +3614,8 @@ app.registerExtension({
 
             header.append(quickBtn, fullBtn, stateChip, snapBtn, loopBtn,
                           seamBtn, zoomOutBtn, zoomInBtn,
-                          fitBtn, addBtn, editBtn, exportBtn, runModeBtn);
+                          fitBtn, addBtn, editBtn, exportBtn,
+                          chunkPlanBtn, runModeBtn);
             // "next run" config bar: reserved space right below the
             // strip, ALWAYS visible -- states what the pin_specs output
             // will do (root generation vs extend/prepend) and carries
@@ -4120,8 +4392,17 @@ app.registerExtension({
             // Purple: not the playhead's amber (time), the pin's orange
             // (the join) or the drop green (an edit) -- this is a clip
             // that does not exist yet.
+            // What the band describes: while the chunk plan is on, the
+            // plan's next slot (once previewed) -- a stale manual pin's
+            // band would describe a run that will not happen.
+            function shownLanding() {
+                if (chunkPlanMode()) {
+                    return planPreview ? planLanding() : null;
+                }
+                return pinLanding();
+            }
             function drawLanding(ctx, w) {
-                const land = pinLanding();
+                const land = shownLanding();
                 if (!land) return;
                 const px = scaleNow() || 1;
                 const frames = land.frames
@@ -4319,7 +4600,7 @@ app.registerExtension({
                 progress);
             const audioLane = mountAudioTrack({ node, api, strip,
                 geometry: () => ({ scale: scaleNow(), entries: lastEntries,
-                    starts: cumStarts, landing: pinLanding() }),
+                    starts: cumStarts, landing: shownLanding() }),
                 changed: () => refresh(),
             });
             container.append(videoWrap, header, progress.el, timelineWrap,
@@ -4481,6 +4762,33 @@ app.registerExtension({
             }
             // + add: popup MENU of the scoped clip list (the dropdown
             // row is gone); click appends to the sequence end
+            // Where a picked clip LANDS. Normally the sequence end.
+            // While the chunk plan is on it lands where the plan says:
+            // the next ROOT goes after the last placed root with a hole
+            // of exactly one undelivered bridge (C - 2W) between -- the
+            // hole the bridge take later fills without moving anything
+            // else, and the reason the two roots visibly do NOT run on
+            // from each other; the next BRIDGE take replaces the first
+            // hole on the strip, which is exactly its length.
+            function addClipToSequence(v) {
+                const text = String(seqWidget.value || "").trimEnd();
+                const p = chunkPlanMode() ? lastPlan : null;
+                if (p?.next?.role === "bridge") {
+                    const es = tlParseSequence(seqWidget.value);
+                    const at = entryLines();
+                    const gi = es.findIndex((e) => e.gap != null);
+                    if (gi >= 0) {
+                        const lines = currentLines();
+                        lines[at[gi]] = v;
+                        setSequence(lines.join("\n"));
+                        return;
+                    }
+                }
+                const gap = p?.next?.role === "root" && text && p.filled.size
+                    ? p.gap : 0;
+                const tail = gap > 0 ? "~ " + gap + "\n" + v : v;
+                setSequence(text ? text + "\n" + tail : v);
+            }
             let addMenu = null;
             function closeAddMenu() {
                 addMenu?.remove();
@@ -4537,9 +4845,7 @@ app.registerExtension({
                         it.addEventListener("mouseleave", () =>
                             it.style.background = "none");
                         it.addEventListener("click", () => {
-                            const text =
-                                String(seqWidget.value || "").trimEnd();
-                            setSequence(text ? text + "\n" + v : v);
+                            addClipToSequence(v);
                             closeAddMenu();
                         });
                         pop.appendChild(it);
@@ -5544,7 +5850,13 @@ app.registerExtension({
                     // back however the gap block was built. Selection
                     // shows in the ink instead of a fill.
                     if (el.dataset?.obvpmGap) {
-                        el.style.background = "none";
+                        // ... except the hole the chunk plan is about to
+                        // fill: that one wears the plan's purple, on
+                        // every frame, so "this is the part of the video
+                        // we generate next" survives playback repaints.
+                        el.style.background =
+                            el.dataset.obvpmPlan === "1"
+                                ? "rgba(96,60,160,0.22)" : "none";
                         el.style.color = i === active ? PAL.text : PAL.sub;
                         return;
                     }
@@ -5601,6 +5913,17 @@ app.registerExtension({
                             (en) => en.clip === pstD.source2);
                         if (k2 >= 0) pinGaps.add(k2);
                     }
+                }
+                if (chunkPlanMode() && planPreview && lastPlan?.next) {
+                    // The plan is this mode's pin, so the pill the user
+                    // needs to click wears the pin purple: the strip's
+                    // END pill while roots are still going (the next
+                    // root lands past the last one, gap between), and
+                    // the pill at the hole once the plan bridges back to
+                    // fill it.
+                    const land = planLanding();
+                    pinGaps.add(land && land.gapIdx >= 0
+                        ? land.gapIdx : entries.length);
                 }
                 // one zone builder for interior gaps AND the strip's two
                 // ends (Le/Re null on the open side). A zone starts
@@ -6123,7 +6446,21 @@ app.registerExtension({
                     // clicking one would silently rewrite the pin this
                     // mode is preserving. The repair items below stay --
                     // they edit the cut, which every mode still plays.
-                    if (side.gen && !upscaleMode()) {
+                    if (side.gen && chunkPlanMode()) {
+                        // Greyed, not hidden: the user should see these
+                        // exist and know the plan, not a bug, is why
+                        // they are quiet.
+                        const g = item(parent,
+                            side.gen.role === "extend"
+                                ? "+ extend new" : "+ prepend new",
+                            "the chunk plan owns the next run -- Run "
+                            + "generates the plan's next chunk, not a "
+                            + "free-form pin. Use \"next chunk\" to see "
+                            + "where it lands.",
+                            () => {});
+                        g.style.color = PAL.sub;
+                        g.style.cursor = "default";
+                    } else if (side.gen && !upscaleMode()) {
                         // pin the seam's clip so the NEXT RUN creates
                         // the take for this side; when that pin is
                         // ALREADY active the item wears the pin purple
@@ -6176,6 +6513,59 @@ app.registerExtension({
                 };
 
                 pop.textContent = "";
+                // While the chunk plan is on it owns the next run, and
+                // this item takes the "+ extend/prepend new" items'
+                // place: it arms the purple preview of exactly where the
+                // plan's NEXT chunk lands -- the next root past the last
+                // one placed, with the bridge hole kept visibly between,
+                // or the first unfilled hole once every root is down.
+                // Sticky like a pin: armed once, it follows the plan
+                // across adds until it is clicked off or the plan is.
+                if (chunkPlanMode()) {
+                    const p = lastPlan;
+                    if (p?.next) {
+                        const what = p.next.role === "root"
+                            ? "root chunk " + p.next.index + " ("
+                              + p.next.frames + " frames)"
+                            : "bridge chunk " + p.next.index + ", into "
+                              + "the hole between chunks "
+                              + (p.next.index - 1) + " and "
+                              + (p.next.index + 1);
+                        const g = item(pop,
+                            planPreview
+                                ? "✓ next chunk — chunk "
+                                  + p.next.index + " shown"
+                                : "next chunk — " + what,
+                            planPreview
+                                ? "the purple marks where chunk "
+                                  + p.next.index + " lands -- click to "
+                                  + "clear"
+                                : "show in purple exactly where chunk "
+                                  + p.next.index + " (" + what + ") will "
+                                  + "be generated next. Run generates it.",
+                            () => {
+                                planPreview = !planPreview;
+                                void refresh();
+                            });
+                        g.style.fontWeight = "600";
+                        g.style.color = planPreview
+                            ? (PAL.light ? "#5e3a9e"
+                                         : TL_ROLE.extend.text)
+                            : PAL.text;
+                    } else {
+                        const g = item(pop,
+                            p?.error || (p?.pending || !p
+                                ? "reading the soundtrack…"
+                                : "chunk plan complete"),
+                            p?.error || (p?.pending || !p
+                                ? ""
+                                : "every chunk of the plan has a take on "
+                                  + "the timeline"),
+                            () => {});
+                        g.style.color = PAL.sub;
+                        g.style.cursor = "default";
+                    }
+                }
                 // Either END pill offers the loop, whether or not the
                 // cut loops yet: "+ loop new" arms the take that CLOSES
                 // the ring -- one run, extending the last clip and
@@ -6185,7 +6575,8 @@ app.registerExtension({
                 const endL = entries[n - 1], endR = entries[0];
                 const atEnd = n > 0 && (i === 0 || i === n)
                     && endL.gap == null && endR.gap == null;
-                if (atEnd && !upscaleMode() && tlPinGrade(endL)
+                if (atEnd && !upscaleMode() && !chunkPlanMode()
+                        && tlPinGrade(endL)
                         && tlPinGrade(endR)) {
                     const cur = pinState();
                     const active = impliesLoop(cur);
@@ -6711,10 +7102,32 @@ app.registerExtension({
                     // marks it out.
                     background: "none",
                 });
-                block.title = `empty space, ${played} frames `
-                    + `(${(played / TL_FPS).toFixed(1)}s)\n`
-                    + "black in the preview and the export -- generate a "
-                    + "bridge to fill it. Hover for its controls.";
+                // The hole the plan's next BRIDGE lands in wears the
+                // plan's purple: the user sees exactly which part of the
+                // video the next Run generates, and why the two roots
+                // around it are not continuous. Marked on the element
+                // (same reason as obvpmGap) because highlight() repaints
+                // every frame.
+                const planHere = chunkPlanMode() && planPreview
+                    && lastPlan?.next?.role === "bridge"
+                    && planLanding()?.gapIdx === i;
+                block.dataset.obvpmPlan = planHere ? "1" : "";
+                if (planHere) {
+                    block.style.background = "rgba(96,60,160,0.22)";
+                    block.style.borderColor = TL_ROLE.extend.text;
+                    block.title = "chunk " + lastPlan.next.index
+                        + ": the bridge the plan generates between "
+                        + "chunks " + (lastPlan.next.index - 1) + " and "
+                        + (lastPlan.next.index + 1) + " (" + played
+                        + " frames delivered)\nRun generates it; the "
+                        + "purple band on the ruler marks the same span.";
+                } else {
+                    block.title = `empty space, ${played} frames `
+                        + `(${(played / TL_FPS).toFixed(1)}s)\n`
+                        + "black in the preview and the export -- "
+                        + "generate a bridge to fill it. Hover for its "
+                        + "controls.";
+                }
                 const cap = document.createElement("div");
                 cap.textContent = `${(played / TL_FPS).toFixed(1)}s`;
                 Object.assign(cap.style, {
@@ -6777,9 +7190,11 @@ app.registerExtension({
                 // A bridge is a PIN, so upscale mode cannot offer one:
                 // the next Run refines the timeline instead of filling
                 // this hole, and setting the pin anyway would rewrite
-                // the one this mode is keeping.
+                // the one this mode is keeping. The chunk plan is the
+                // other owner of a hole like this: it fills it itself,
+                // once its two root chunks are placed.
                 const canBridge = !ends && !holes && !noMctx
-                    && !upscaleMode();
+                    && !upscaleMode() && !chunkPlanMode();
                 const cur0 = shownPin();
                 const isThis = canBridge && cur0?.role === "bridge"
                     && cur0.source === left.clip
@@ -6793,7 +7208,12 @@ app.registerExtension({
                 // pressed look when this hole is already the pin
                 bridge.style.boxShadow = isThis
                     ? "0 0 0 2px rgba(255,255,255,0.7)" : "none";
-                bridge.title = upscaleMode()
+                bridge.title = chunkPlanMode()
+                    ? "the chunk plan is on, so the next Run generates "
+                      + "the plan's next chunk. The plan fills this hole "
+                      + "itself, once the root chunks on both sides are "
+                      + "placed."
+                    : upscaleMode()
                     ? "upscaling is on, so the next Run refines "
                       + "this timeline rather than generating anything. "
                       + "Switch to generation to bridge this space."
@@ -6948,6 +7368,11 @@ app.registerExtension({
                     playedArr.push(played);
                     totalFrames += played;
                 });
+                // the plan reads the anchors the metas just carried, so
+                // it is recomputed here, after them and before anything
+                // paints from it
+                lastPlan = chunkPlanMode()
+                    ? chunkPlanCompute(entries, metas) : null;
                 updateButtons();
                 void probeFull();
 
@@ -7710,6 +8135,60 @@ app.registerExtension({
                     frame.append(value);
                     return;
                 }
+                if (chunkPlanMode()) {
+                    // The plan IS the pin in this mode: the row says
+                    // which chunk the next Run generates, in the pin's
+                    // own purple. The duration box stays -- here it is
+                    // the CHUNK length every slot of the plan is cut to,
+                    // not one take's length.
+                    const p = lastPlan;
+                    if (p?.next) {
+                        value.textContent = p.next.role === "root"
+                            ? "chunk plan — next: root chunk "
+                              + p.next.index + " (" + p.next.frames
+                              + " frames)"
+                            : "chunk plan — next: bridge chunk "
+                              + p.next.index + " into the hole between "
+                              + "chunks " + (p.next.index - 1) + " and "
+                              + (p.next.index + 1);
+                        value.title = (p.done ?? 0) + " of "
+                            + (p.total ?? 0) + " chunks placed. The odd "
+                            + "chunks are generated first as independent "
+                            + "roots, then the even chunks bridge the "
+                            + "gaps, so every frame is sampled exactly "
+                            + "once. "
+                            + (planPreview
+                                ? "The purple marks where this chunk "
+                                  + "lands."
+                                : "Click the dash pill at a clip's end "
+                                  + "and choose \"next chunk\" to see "
+                                  + "exactly where it lands.");
+                    } else if (p && !p.error && !p.pending) {
+                        value.textContent = "chunk plan — complete ("
+                            + (p.done ?? 0) + " chunks placed)";
+                        value.title = "every chunk of the plan has a "
+                            + "take on the timeline; switch chunk plan "
+                            + "off to generate freely again.";
+                    }
+                    if (!p || p.error || p.pending) {
+                        // not an active claim about the next Run -- the
+                        // resting surface, like "no pin"
+                        value.textContent = "chunk plan — "
+                            + (p?.error || "reading the soundtrack…");
+                        value.title = value.textContent;
+                        value.style.color = PAL.sub;
+                        value.style.background = PAL.rest;
+                        value.style.borderColor = PAL.edge;
+                    } else {
+                        value.style.background = TL_ROLE.extend.bg;
+                        value.style.color = "#fff";
+                        value.style.borderColor = "transparent";
+                    }
+                    value.style.flexShrink = "1";
+                    value.style.minWidth = "0";
+                    frame.append(value, durWrap);
+                    return;
+                }
                 if (!st) {
                     // no pin: the same surface as the clip-info box, so
                     // "nothing special is happening" looks like the
@@ -7964,6 +8443,32 @@ app.registerExtension({
                     });
                     return b;
                 };
+                // The same buttons, greyed and inert: while the chunk
+                // plan owns the next run these cannot arm anything, and
+                // hiding them outright would read as the feature being
+                // missing. They stay visible so the mode change is
+                // legible -- and clicking one must not clear a pin the
+                // plan is keeping.
+                const mkDeadToggle = (label) => {
+                    const b = document.createElement("button");
+                    b.textContent = label;
+                    b.title = "the chunk plan owns the next run: Run "
+                        + "generates the plan's next chunk. Click the "
+                        + "dash pill at a clip's end and choose \"next "
+                        + "chunk\" to see exactly where it lands.";
+                    Object.assign(b.style, {
+                        background: PAL.rest,
+                        border: "1px solid " + PAL.edge,
+                        color: PAL.sub, opacity: "0.55",
+                        cursor: "default", width: "88px",
+                        textAlign: "center", padding: "1px 0",
+                        boxSizing: "border-box",
+                        font: "11px/16px sans-serif",
+                        whiteSpace: "nowrap", flexShrink: "0",
+                        borderRadius: "4px",
+                    });
+                    return b;
+                };
                 const wrap = document.createElement("span");
                 Object.assign(wrap.style, {
                     display: "flex", gap: "2px", flexShrink: "0",
@@ -7980,7 +8485,13 @@ app.registerExtension({
                     // clicking one would clear the pin this mode is
                     // supposed to be keeping safe. "load settings" stays
                     // -- it reads a sidecar and cares about neither.
-                    ...(upscaleMode() ? [] : [
+                    // Under the chunk plan they are NOT hidden: the user
+                    // asked for them greyed out, so the mode reads as a
+                    // hand-over rather than as a missing feature.
+                    ...(upscaleMode() ? [] : chunkPlanMode() ? [
+                        mkDeadToggle("prepend clip"),
+                        mkDeadToggle("extend clip"),
+                    ] : [
                         mkToggle("prepend", "prepend clip",
                             "Next run prepends into this clip's head"),
                         mkToggle("extend", "extend clip",
