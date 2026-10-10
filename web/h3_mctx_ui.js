@@ -8185,6 +8185,11 @@ app.registerExtension({
                         && !node.outputs.some(o => o.name === "chunk_audio")) {
                     node.addOutput("chunk_audio", "AUDIO");
                 }
+                // ...and the plan_status string that followed it.
+                if (node.outputs?.length === 5
+                        && !node.outputs.some(o => o.name === "plan_status")) {
+                    node.addOutput("plan_status", "STRING");
+                }
                 void refresh();
                 return r;
             };

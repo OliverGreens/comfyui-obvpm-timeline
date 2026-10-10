@@ -36,7 +36,48 @@ audio encoding.
 
 **chunk_audio** is `None` when no custom track is selected or when the
 Timeline is in upscale mode. Bypass the ASR branch in those cases. The
-existing four output sockets keep their indices; **chunk_audio** is appended.
+existing four output sockets keep their indices; **chunk_audio** and then
+**plan_status** are appended.
+
+## Chunk plan: odd-first generation
+
+Extending a clip re-samples its parent's tail window in a fresh pass, so a
+long chain of extensions slowly accumulates colour and sharpness drift:
+each link adds a little. The **chunk plan** toggle removes the chain. It
+splits the soundtrack into chunks and generates them so that every frame
+is sampled exactly once — either as a first-pass generation or as a single
+bridge pass — no matter how long the audio is.
+
+Turn on **chunk plan** (an audio track is required; upscale mode ignores
+it). The Timeline measures the track and lays out slots on the audio grid:
+
+- **Odd chunks (1, 3, 5, …)** are independent root generations. They carry
+  no pin at all: each is a plain first-pass run whose audio is forced to
+  its own slot, so chunk 3 never inherits anything from chunk 1.
+- **Even chunks (2, 4, …)** fill the gaps. Each is one bridge run pinned by
+  *both* neighbours: a masked extension of the left chunk's tail and a
+  soft arrival into the right chunk's head. The bridge is the only thing
+  that ever touches a neighbour's latents, and only its overlap.
+
+Each **Queue the Timeline** then emits the *next* chunk of the plan — all
+roots first, then the bridges — through the usual **pin_specs**, **length**
+and **chunk_audio** outputs, so the ASR-prompt wiring keeps working per
+chunk. **plan_status** (a STRING output) describes the plan and names the
+next chunk; connect it to any text display.
+
+The Timeline's video **duration** is the chunk length (snapped to the
+shared audio-video grid; it must exceed twice the **bridge window**, 39 or
+90 frames). Roots step forward by a fixed stride, and each saved take
+records its audio slot, so the plan stays anchored even while roots are
+still butt-joined on the timeline and the bridges are missing. Adding a
+take advances the plan; deleting one frees its slot for a rerun. Bridges
+are inserted between their two source chunks automatically. When every
+slot is filled the status reports the plan complete, and further runs
+append past the plan as ordinary generations.
+
+Keep the same reference image and a consistent prompt across the roots:
+they are independent generations, and the shared conditioning plus the
+bridge overlaps are what make them read as one continuous take.
 
 ## Audio row controls
 

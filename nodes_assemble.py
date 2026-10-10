@@ -911,8 +911,8 @@ class H3Timeline:
 
     CATEGORY = "obvpm/h3"
     FUNCTION = "emit"
-    RETURN_TYPES = (wt.PINSPECS, "INT", "STRING", "BOOLEAN", "AUDIO")
-    RETURN_NAMES = ("pin_specs", "length", "sequence", "upscaling", "chunk_audio")
+    RETURN_TYPES = (wt.PINSPECS, "INT", "STRING", "BOOLEAN", "AUDIO", "STRING")
+    RETURN_NAMES = ("pin_specs", "length", "sequence", "upscaling", "chunk_audio", "plan_status")
     OUTPUT_TOOLTIPS = (
         "Pin spec for the clip pinned in the timeline widget (extend/"
         "prepend), plus the custom audio track when set. Wire to H3MCtxApplyPins "
@@ -936,6 +936,12 @@ class H3Timeline:
         "head/tail and bridge overlaps, before VAE encoding. Feed to ASR and "
         "use its transcript in the video prompt. None without custom audio "
         "or in upscale mode. Wire length to the generation latent so they agree.",
+        "One line describing the chunk plan and which chunk is next, when "
+        "the chunk_plan toggle is on: roots (independent first-pass "
+        "generations) first, then one-pass bridges into the gaps, so every "
+        "frame is sampled exactly once and quality never degrades down a "
+        "chain. Empty when the plan is off. Show it with a ShowText-style "
+        "node to see what each Queue will produce.",
     )
     DESCRIPTION = (
         "Timeline editor for composed clips: seam-aware blocks, "
@@ -1166,11 +1172,35 @@ class H3Timeline:
                 }),
                 "audio_track": ("STRING", {"default": "", "multiline": False,
                     "tooltip": "Custom audio row state, managed by the timeline."}),
+                # APPENDED LAST (see the note above): widgets_values is
+                # positional, so new widgets may only go on the end.
+                "chunk_plan": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Odd-first chunk planning for the audio row. "
+                               "On: the manual pin is ignored and every Run "
+                               "generates the NEXT chunk of a plan computed "
+                               "from the soundtrack length -- the odd chunks "
+                               "(1, 3, 5, ...) first as independent roots, "
+                               "then one-pass bridges (2, 4, ...) into the "
+                               "gaps, each pinned by both neighbours. Every "
+                               "frame is then sampled exactly once, so "
+                               "quality cannot drift down an extend chain. "
+                               "Add each take with '+ add to timeline'; the "
+                               "plan reads the timeline and advances. Needs "
+                               "an audio track; duration_seconds is the "
+                               "chunk length."}),
+                "bridge_window": (["39", "90"], {
+                    "default": "39",
+                    "tooltip": "Frames pinned on BOTH sides of every bridge "
+                               "chunk. 39 (1.63 s) is the measured-seamless "
+                               "default; 90 (3.75 s) gives the model more "
+                               "context at the cost of a shorter new stride."}),
             },
         }
 
     @classmethod
-    def IS_CHANGED(cls, pin_state="", audio_track="", **_):
+    def IS_CHANGED(cls, pin_state="", audio_track="", sequence="",
+                   chunk_plan=False, **_):
         # Re-run when the pin selection OR the pinned file(s) change
         # (same clip name, new content after a re-save).
         state = cls._parse_pin_state(pin_state)
@@ -1180,6 +1210,10 @@ class H3Timeline:
             track = parse_track(audio_track)
             if track:
                 sig += track_id(track)
+        if chunk_plan:
+            # The plan advances with the timeline: every take added moves
+            # the NEXT chunk, so the sequence is part of the answer.
+            sig += "|plan|" + (sequence or "")
         if state is None:
             return sig
         for key in ("source", "source2"):
@@ -1367,7 +1401,8 @@ class H3Timeline:
                       else "17k+5 ladder"))
 
     def emit(self, sequence="", pin_state="", duration_seconds=8.0,
-             upscaling=False, audio_track="", **_):
+             upscaling=False, audio_track="", chunk_plan=False,
+             bridge_window="39", **_):
         # A graph saved while this was the run_mode combo hands over its
         # string; "upscale" is the only value that meant on
         if isinstance(upscaling, str):
@@ -1376,16 +1411,37 @@ class H3Timeline:
         from .timeline_audio import parse_track, prepare_chunk_audio
         track = parse_track(audio_track)
         state = self._parse_pin_state(pin_state)
-        length, phrase = self._emit_length(state, duration_seconds)
+        plan_info = None
+        if chunk_plan and not upscaling:
+            from . import chunkplan
+            plan_info = chunkplan.plan(track, sequence, duration_seconds,
+                                       bridge_window)
+            # The plan owns the length: roots and bridges share the chunk
+            # length, both on the shared AV grid (a bridge masks).
+            nxt = plan_info["next"]
+            length = (nxt["frames"] if nxt is not None
+                      else self._run_length(duration_seconds, False))
+            phrase = plan_info["status"]
+        else:
+            length, phrase = self._emit_length(state, duration_seconds)
 
-        def result(specs):
+        def result(specs, forced_start=None):
+            audio = None
             if track and not upscaling:
-                audio_spec = prepare_chunk_audio(specs, track, sequence, length)
-                return (specs + [audio_spec], length, sequence, upscaling, audio_spec["audio"])
-            return (specs, length, sequence, upscaling, None)
+                audio_spec = prepare_chunk_audio(specs, track, sequence,
+                                                 length,
+                                                 forced_start=forced_start)
+                specs = list(specs) + [audio_spec]
+                audio = audio_spec["audio"]
+            return (specs, length, sequence, upscaling, audio,
+                    plan_info["status"] if plan_info is not None else "")
 
-        _LOG.info("obvpm.h3: timeline run: %s; length %s",
+        _LOG.info("obvpm.h3: timeline run: %s; %s",
                   "upscale and render" if upscaling else "generate", phrase)
+        if plan_info is not None:
+            # The plan IS the pin: a manual pin_state is ignored while
+            # chunk_plan is on (the widget keeps its value for later).
+            return self._emit_plan(plan_info, result)
         if state is None:
             return result([])
         # The soft hold applies to the ARRIVING side only: the
@@ -1432,6 +1488,50 @@ class H3Timeline:
                   state["window"],
                   "" if state.get("cut") is None
                   else ", from the cut at frame %d" % state["cut"])
+        return result(specs)
+
+    def _emit_plan(self, plan_info, result):
+        """Emit the NEXT chunk of the plan (see chunkplan.py): a root, or
+        a one-pass bridge between the two roots that already exist.
+
+        Roots carry no pin specs at all -- that is the whole point: an
+        independent first-pass generation, placed on the audio grid by a
+        forced slot in the chunk_audio descriptor. Bridges are the only
+        pinned runs, and each is exactly one pass, pinned by BOTH
+        neighbours: a masked extend of the left root's tail (the
+        measured-seamless departure) and a both-mode arrival into the
+        right root's head (the measured-seamless arrival). The two pins'
+        audio anchors agree by construction, because the slots were cut
+        from the same stride.
+        """
+        nxt = plan_info["next"]
+        if nxt is None:
+            _LOG.info("obvpm.h3: chunk plan complete (%d runs); this run "
+                      "is a plain root appended past the plan",
+                      plan_info["n_runs"])
+            return result([])
+        if nxt["role"] == "root":
+            _LOG.info("obvpm.h3: chunk plan: ROOT chunk %d, %d frames, "
+                      "audio slot at raw frame %d (no pin)",
+                      nxt["index"], nxt["frames"], nxt["raw_start"])
+            return result([], forced_start=nxt["raw_start"])
+        filled = plan_info["filled"]
+        left, right = filled.get(nxt["left"]), filled.get(nxt["right"])
+        if not left or not right:
+            raise ValueError(
+                "chunk plan: bridge chunk %d needs its neighbours at raw "
+                "frames %d and %d on the timeline; generate and add the "
+                "root takes first." % (nxt["index"], nxt["left"],
+                                       nxt["right"]))
+        window = str(plan_info["window"])
+        specs = (self._specs_for(left, "extend", window, None,
+                                 BRIDGE_MODES["extend"]) +
+                 self._specs_for(right, "prepend", window, None,
+                                 BRIDGE_MODES["prepend"],
+                                 mask_shape=(10, 0.40, 0.0)))
+        _LOG.info("obvpm.h3: chunk plan: BRIDGE chunk %d between %s and %s, "
+                  "%d frames, window %s (masked extend + both arrival)",
+                  nxt["index"], left, right, nxt["frames"], window)
         return result(specs)
 
 

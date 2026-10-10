@@ -16,6 +16,7 @@ And it also supports creating seamless looping videos.
 - **Audio conditioning for lip sync:** the matching source audio is encoded into H3's audio latent during generation. The pack's Save / Trim and Save nodes write the original waveform into the saved video.
 - **Automatic chunk timing:** generate, extend, prepend, and bridge operations select their own audio start time and duration from the actual video frame range. Pinned overlaps are included, and picture and sound are trimmed together at the joins.
 - **Audio output for transcription:** Timeline's new **chunk_audio** output provides the exact waveform used for the upcoming chunk, including its overlaps, so an ASR model can transcribe it before the video prompt is encoded.
+- **Chunk plan (odd-first generation):** with a soundtrack loaded, the Timeline splits it into chunks and emits one planned run per Queue: independent first-pass roots (chunks 1, 3, 5, …) first, then single-pass bridges (2, 4, …) pinned by both neighbours. Every frame is sampled exactly once, so long narrations no longer degrade with each extension. See [chunk plan](docs/custom-audio.md#chunk-plan-odd-first-generation).
 - **Existing workflows remain supported:** removing the custom track restores generated-audio behavior. The original four Timeline output sockets keep their positions.
 
 ## Updates
@@ -23,6 +24,7 @@ And it also supports creating seamless looping videos.
 ### Fork: custom audio
 
 - Added custom-audio conditioning, waveform controls, and the **chunk_audio** output.
+- Added the **chunk plan** toggle, the **bridge window** setting, and the **plan_status** output for drift-free long audio-driven generations.
 - Updated the included timeline workflow with audio-to-ASR prompt wiring and generation mode enabled for an empty timeline.
 
 ### 0.1.0 (2026-09-21)
@@ -59,6 +61,7 @@ Every generated clip is saved together with a motion context file (`.mctx`) that
 **Timeline**
 
 - **Custom audio for lip sync**: upload or drop a soundtrack onto the audio row below the video strip. Generation, extension, prepending and bridges automatically encode the matching audio window, including pinned overlap. See [custom audio setup and timing](docs/custom-audio.md).
+- **Chunk plan**: with a soundtrack, one toggle turns long audio into a queue of drift-free runs — independent roots first, single-pass bridges second, each frame sampled once. See [chunk plan](docs/custom-audio.md#chunk-plan-odd-first-generation).
 - **Mini Video Editor**: Drag in clips from anywhere, reorder them by dragging, trim the ends, cut left / cut right at the playhead, undo cuts, and open gaps.
 - **Quick preview**: plays through the clips right away. **Full preview** assembles them into a single video file, losslessly where possible. **Export** saves the finished video.
 - **Load Settings, Prompts from Clips**: restores the prompt, seed, settings and references that a clip was generated with, so you don't have to keep track of them yourself.
@@ -147,6 +150,10 @@ Connect **Timeline → chunk_audio** to your ASR node's **audio** input, then in
 The output contains the full upcoming generation window, including head/tail context and both bridge overlaps. It is available before Apply Pins and uses the same waveform that will be encoded, so this wiring does not create a dependency cycle. ASR timestamps start at the beginning of that raw chunk.
 
 **Bypass the ASR branch when no custom track is selected or when upscaling:** `chunk_audio` is `None` in those modes.
+
+### Avoid drift on long audio: the chunk plan
+
+Chained extensions re-sample the previous clip's tail on every pass, so each extension in a long chain adds a little colour and sharpness drift. Turn on **chunk plan** (with a soundtrack selected) and the Timeline instead splits the audio into chunks and emits the next planned run on every Queue: first the **odd chunks** — independent first-pass generations with no pin at all — then the **even chunks**, each a single bridge pass pinned by both neighbours. Every frame is sampled exactly once, so quality no longer depends on how many runs the video needed. The **plan_status** string output explains the plan and which chunk runs next; the video **duration** sets the chunk length, and **bridge window** the overlap each bridge borrows. Keep the same reference image and a consistent prompt across the runs. See [chunk plan](docs/custom-audio.md#chunk-plan-odd-first-generation) for the full mechanics.
 
 ### Timing and existing clips
 

@@ -184,7 +184,7 @@ class Conditioning(unittest.TestCase):
              patch.object(ta, "sequence_positions", return_value=([], 0)), \
              patch.object(ta, "load_audio", return_value={
                  "waveform": torch.ones(1, 1, 2400), "sample_rate": 24}):
-            specs, length, _, _, chunk = na.H3Timeline().emit(audio_track=json.dumps(track()))
+            specs, length, _, _, chunk, _ = na.H3Timeline().emit(audio_track=json.dumps(track()))
         self.assertEqual(len(specs), 1)
         self.assertIs(specs[0]["audio"], chunk)
         node = np.H3MCtxApplyPins()
@@ -201,8 +201,8 @@ class Conditioning(unittest.TestCase):
         na = importlib.import_module("obvpm_tl_test.nodes_assemble")
         self.assertEqual(na.H3Timeline().emit()[0], [])
         self.assertEqual(na.H3Timeline().emit(upscaling=True, audio_track=json.dumps(track()))[0], [])
-        self.assertIsNone(na.H3Timeline().emit()[-1])
-        self.assertIsNone(na.H3Timeline().emit(upscaling=True, audio_track=json.dumps(track()))[-1])
+        self.assertIsNone(na.H3Timeline().emit()[4])
+        self.assertIsNone(na.H3Timeline().emit(upscaling=True, audio_track=json.dumps(track()))[4])
 
 
 class ChunkAudioOutput(unittest.TestCase):
@@ -244,7 +244,7 @@ class ChunkAudioOutput(unittest.TestCase):
                      patch.object(ta, "track_id", return_value="track"), \
                      patch.object(ta, "load_audio", return_value=source) as load, \
                      patch.object(ta, "sequence_positions", return_value=(entries, total)):
-                    specs, length, _, _, sound = timeline.emit(
+                    specs, length, _, _, sound, _ = timeline.emit(
                         pin_state="" if role == "root" else json.dumps(state),
                         duration_seconds=243 / 24,
                         audio_track=json.dumps(track(source_start=10)))
@@ -287,6 +287,63 @@ class ChunkAudioOutput(unittest.TestCase):
                                 torch.zeros(1, 32, 2, fr.audio_total(192)))
             with self.assertRaisesRegex(ValueError, "chunk_audio no longer matches"):
                 ta.apply_audio([[None, {}]], target, [], descriptor, object())
+
+
+class PlannedRootAudio(unittest.TestCase):
+    """A chunk-plan root owns its slot: the timeline end is not the answer
+    while other planned chunks are still missing from it."""
+
+    def test_forced_start_places_the_root_at_its_plan_slot(self):
+        source = {"waveform": torch.arange(4800, dtype=torch.float32)[None, None],
+                  "sample_rate": 24}
+        with patch.object(ta, "track_id", return_value="track"), \
+             patch.object(ta, "load_audio", return_value=source), \
+             patch.object(ta, "sequence_positions",
+                          return_value=([entry("A", anchor=0)], 192)):
+            natural = ta.prepare_chunk_audio([], track(), "", 192)
+            self.assertEqual(natural["raw_start"], 192)  # the timeline end
+            self.assertNotIn("forced", natural)
+            forced = ta.prepare_chunk_audio([], track(), "", 192, forced_start=384)
+        self.assertEqual(forced["raw_start"], 384)
+        self.assertTrue(forced["forced"])
+        expected = ta.waveform_window(source, track(), 384, 192)
+        torch.testing.assert_close(forced["audio"]["waveform"], expected["waveform"])
+
+    def test_forced_start_rejects_pinned_specs(self):
+        spec = {"source_kind": "clip", "source": {
+            "self_id": "A",
+            "video_latent": torch.zeros(1, 24, fr.frames_to_latents(243), 2, 2),
+            "audio_latent": torch.zeros(1, 32, 2, fr.audio_total(243)),
+            "meta": {"raw_frames": 243, "delivered_frames": 243}},
+            "take_from": "tail", "place": "before", "requested_window": 39}
+        with patch.object(ta, "track_id", return_value="track"), \
+             patch.object(ta, "load_audio", return_value={
+                 "waveform": torch.ones(1, 1, 4800), "sample_rate": 24}), \
+             patch.object(ta, "sequence_positions", return_value=([], 0)):
+            with self.assertRaisesRegex(ValueError, "unpinned root"):
+                ta.prepare_chunk_audio([spec], track(), "", 243, forced_start=384)
+
+    def test_apply_audio_trusts_a_forced_descriptor_and_records_the_slot(self):
+        source = {"waveform": torch.ones(1, 1, 4800), "sample_rate": 24}
+        video = torch.zeros(1, 24, fr.frames_to_latents(192), 2, 2)
+        latent = torch.zeros(1, 32, 2, fr.audio_total(192))
+
+        class VAE:
+            audio_sample_rate = 24
+
+            def encode(self, wave):
+                return latent.clone()
+
+        with patch.object(ta, "track_id", return_value="track"), \
+             patch.object(ta, "load_audio", return_value=source), \
+             patch.object(ta, "sequence_positions",
+                          return_value=([entry("A", anchor=0)], 192)):
+            descriptor = ta.prepare_chunk_audio([], track(), "", 192, forced_start=384)
+            _, out, _ = ta.apply_audio([[None, {}]], av.pack_av(video, latent),
+                                       [], descriptor, VAE())
+        # The natural start (192) would have failed the match check; the
+        # forced slot passes it and is saved for the plan to find later.
+        self.assertEqual(out[ta.LATENT_KEY]["record"]["raw_start"], 384)
 
 
 if __name__ == "__main__":

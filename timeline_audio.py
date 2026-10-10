@@ -81,15 +81,21 @@ def sequence_positions(sequence):
     return entries, cursor
 
 
-def raw_start(pins, entries, total, frames, identity):
-    """Absolute frame under raw frame zero, using resolved source windows."""
-    origin = 0
+def timeline_origin(entries, identity):
+    """Raw frame under delivered timeline frame 0, from the first saved
+    anchor; 0 when no clip on the timeline carries this track's anchors."""
     for e in entries:
         anchor = saved_anchor(e.get("header"), identity)
         if anchor is not None:
-            origin = (anchor + int(e["header"].get("pinned_head_frames", 0))
-                      + e["enter"] - e["timeline_start"])
-            break
+            header = e.get("header") or {}
+            return (anchor + int(header.get("pinned_head_frames", 0))
+                    + e["enter"] - e["timeline_start"])
+    return 0
+
+
+def raw_start(pins, entries, total, frames, identity):
+    """Absolute frame under raw frame zero, using resolved source windows."""
+    origin = timeline_origin(entries, identity)
     starts = []
     for pin in pins:
         spec = pin["spec"]
@@ -147,18 +153,32 @@ def load_audio(filename):
     return audio
 
 
-def prepare_chunk_audio(specs, track, sequence, frames):
-    """One waveform shared by upstream ASR and downstream VAE encoding."""
+def prepare_chunk_audio(specs, track, sequence, frames, forced_start=None):
+    """One waveform shared by upstream ASR and downstream VAE encoding.
+
+    forced_start places an UNPINNED root chunk at an absolute slot on the
+    audio grid. The chunk plan needs this because a planned root's slot
+    is fixed by the plan, while the natural start (end of the delivered
+    timeline) is wrong while even chunks are still missing from it.
+    """
     from .nodes_pins import _prepare_pins
     pins = _prepare_pins(specs, True, timing_only=True) if specs else []
     if sum(p["covered"] for p in pins) >= frames:
         raise ValueError("Custom audio: pin windows fill the generation chunk; increase its length.")
     identity = track_id(track)
     entries, total = sequence_positions(sequence)
-    start = raw_start(pins, entries, total, frames, identity)
+    if forced_start is not None:
+        if pins:
+            raise ValueError("Custom audio: a forced chunk start is only legal for an unpinned root chunk.")
+        start = int(forced_start)
+    else:
+        start = raw_start(pins, entries, total, frames, identity)
     sound = waveform_window(load_audio(track["file"]), track, start, frames)
-    return {"source_kind": MARKER, "track": track, "sequence": sequence,
-            "audio": sound, "raw_start": start, "frames": frames, "identity": identity}
+    out = {"source_kind": MARKER, "track": track, "sequence": sequence,
+           "audio": sound, "raw_start": start, "frames": frames, "identity": identity}
+    if forced_start is not None:
+        out["forced"] = True
+    return out
 
 
 def apply_audio(conditioning, latent, pins, descriptor, audio_vae):
@@ -172,7 +192,13 @@ def apply_audio(conditioning, latent, pins, descriptor, audio_vae):
     video, previous = unpack_av(latent)
     frames = fr.pixel_frames(video.shape[2])
     entries, total = sequence_positions(descriptor["sequence"])
-    start = raw_start(pins, entries, total, frames, identity)
+    if descriptor.get("forced") and not pins:
+        # Planned root chunk: the plan owns its slot on the audio grid;
+        # the end of the delivered timeline is not the answer while
+        # other planned chunks are still missing from it.
+        start = int(descriptor["raw_start"])
+    else:
+        start = raw_start(pins, entries, total, frames, identity)
     _LOG.info("obvpm.h3: custom audio %s, source %.6fs for %.6fs "
               "(%d raw frames including all pin overlaps)", track["file"],
               track["source_start"] + (start - track["start_frame"]) / fr.FPS,
