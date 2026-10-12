@@ -277,10 +277,15 @@ export). The node itself:
 | `duration_seconds` | FLOAT | how long the next generation should be; the `length` output converts and snaps it |
 | `upscaling` | BOOLEAN (toolbar) | which half of the workflow a Run is for: off generates the next take, on refines the whole timeline and renders the full sequence. Driven by the **upscale** toggle on the strip toolbar past **export**, not from the setup widgets |
 
-Outputs: `pin_specs`, `length`, `sequence`, `upscaling`, `chunk_audio` (AUDIO).
+Outputs: `pin_specs`, `length`, `sequence`, `upscaling`, `chunk_audio` (AUDIO),
+`root_generation` (BOOLEAN), `plan_status` (STRING).
 `chunk_audio` supplies the upcoming generation's custom waveform, including
 pin overlaps, to an ASR node upstream of the video prompt. It is `None`
-without a custom track or in upscale mode.
+without a custom track or in upscale mode. `root_generation` is **true** when
+the run about to happen is a root (an odd chunk — or no chunk is planned,
+which is an ordinary root-like take) and **false** when it is a bridge (an
+even chunk), so prompts can branch on the role with no math; `plan_status`
+describes the plan in one line.
 
 **Switching branches.** A workflow that can both generate a take and
 refine the timeline holds two branches that must never run together.

@@ -184,7 +184,7 @@ class Conditioning(unittest.TestCase):
              patch.object(ta, "sequence_positions", return_value=([], 0)), \
              patch.object(ta, "load_audio", return_value={
                  "waveform": torch.ones(1, 1, 2400), "sample_rate": 24}):
-            specs, length, _, _, chunk, _ = na.H3Timeline().emit(audio_track=json.dumps(track()))
+            specs, length, _, _, chunk, _, _ = na.H3Timeline().emit(audio_track=json.dumps(track()))
         self.assertEqual(len(specs), 1)
         self.assertIs(specs[0]["audio"], chunk)
         node = np.H3MCtxApplyPins()
@@ -244,7 +244,7 @@ class ChunkAudioOutput(unittest.TestCase):
                      patch.object(ta, "track_id", return_value="track"), \
                      patch.object(ta, "load_audio", return_value=source) as load, \
                      patch.object(ta, "sequence_positions", return_value=(entries, total)):
-                    specs, length, _, _, sound, _ = timeline.emit(
+                    specs, length, _, _, sound, _, _ = timeline.emit(
                         pin_state="" if role == "root" else json.dumps(state),
                         duration_seconds=243 / 24,
                         audio_track=json.dumps(track(source_start=10)))

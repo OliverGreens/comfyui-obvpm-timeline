@@ -1,4 +1,4 @@
-"""Odd-first chunk planning: roots first, bridges into the gaps.
+"""Odd-first chunk planning: roots are the odd chunks, bridges fill gaps.
 
 Why this exists: every masked extend re-samples its parent's tail window
 in a fresh pass, so a chain of extends accumulates sampling/VAE drift --
@@ -29,8 +29,11 @@ root sits S frames after the left one -- which is what the slots encode.
 Coverage: (n_odd - 1)*S + C >= audio frames, so the last root may run
 past the end of the soundtrack (silence-padded, trimmed at export).
 
-Generation ORDER is roots ascending, then bridges ascending: a bridge
-can only be pinned once both of its roots exist. A slot counts as filled
+Generation ORDER interleaves the two roles: root 1, root 2, bridge 2,
+then root 3, bridge 4, root 4, bridge 6, ... -- each bridge runs as soon
+as its two roots exist, so the timeline closes each gap right after
+opening it instead of leaving every hole until the end. A bridge can
+never be scheduled before its roots. A slot counts as filled
 when a clip on the timeline carries a saved audio anchor at exactly its
 raw_start -- the same anchors Apply Pins writes into every take's
 sidecar, so "what is done" is read from the timeline itself and the plan
@@ -107,9 +110,19 @@ def slots(base, g):
 
 
 def generation_order(sl):
-    """Roots ascending, then bridges ascending."""
-    return ([s for s in sl if s["role"] == "root"]
-            + [s for s in sl if s["role"] == "bridge"])
+    """Root 1, root 2, bridge 2, root 3, bridge 4, root 4, ...
+
+    Two roots open the first gap, then every bridge runs right after the
+    root that opens the next one: 1, 3, 2, 5, 4, 7, 6, 9, 8, ... Each
+    bridge is still only scheduled once BOTH of its roots precede it.
+    """
+    roots = [s for s in sl if s["role"] == "root"]
+    bridges = [s for s in sl if s["role"] == "bridge"]
+    out = roots[:1]
+    for j in range(1, len(roots)):
+        out.append(roots[j])
+        out.append(bridges[j - 1])
+    return out
 
 
 def filled_anchors(sequence, identity):

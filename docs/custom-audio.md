@@ -36,8 +36,8 @@ audio encoding.
 
 **chunk_audio** is `None` when no custom track is selected or when the
 Timeline is in upscale mode. Bypass the ASR branch in those cases. The
-existing four output sockets keep their indices; **chunk_audio** and then
-**plan_status** are appended.
+existing four output sockets keep their indices; **chunk_audio**,
+**root_generation** and then **plan_status** are appended.
 
 ## Chunk plan: odd-first generation
 
@@ -59,11 +59,20 @@ it). The Timeline measures the track and lays out slots on the audio grid:
   soft arrival into the right chunk's head. The bridge is the only thing
   that ever touches a neighbour's latents, and only its overlap.
 
-Each **Queue the Timeline** then emits the *next* chunk of the plan — all
-roots first, then the bridges — through the usual **pin_specs**, **length**
+Each **Queue the Timeline** then emits the *next* chunk of the plan —
+roots and bridges **interleaved**: 1, 3, 2, 5, 4, 7, 6, 9, 8… Each bridge
+runs as soon as both of its roots exist, so the timeline closes each gap
+right after opening it instead of leaving every hole until the end. The
+runs go through the usual **pin_specs**, **length**
 and **chunk_audio** outputs, so the ASR-prompt wiring keeps working per
-chunk. **plan_status** (a STRING output) describes the plan and names the
-next chunk; connect it to any text display.
+chunk. **root_generation** (a BOOLEAN output, right under **chunk_audio**)
+says what this run is: **true** for a root — an odd chunk, or no chunk
+planned at all (plan off, upscale mode, or the plan complete, which is an
+ordinary root-like take) — and **false** for a bridge, the even chunk.
+Feed it straight to a boolean gate or a text switch to swap the prompt per
+role: root wording on true, bridge wording on false, no math needed.
+**plan_status** (a STRING output) describes the plan and
+names the next chunk; connect it to any text display.
 
 The Timeline's video **duration** is the chunk length (snapped to the
 shared audio-video grid; it must exceed twice the **bridge window**, 39 or
@@ -82,8 +91,9 @@ it is on the strip shows where each chunk goes:
 - **+ add** places the next root past the last one with a hole exactly one
   undelivered bridge wide between them — the two roots visibly do *not*
   run on from each other, because they are not continuous: the bridge
-  between them is still missing. A bridge take instead fills the first
-  hole on the strip, which is exactly its length.
+  between them is still missing. A bridge take instead fills the hole
+  between its two roots — with the interleaved order that is the hole
+  the last two roots just opened, exactly the bridge's length.
 - The dash pill at a clip's end offers **next chunk**: it marks in purple
   the exact span the next run generates — the next root's slot past the
   last root, or the hole a bridge will fill. The band shows on the ruler

@@ -95,10 +95,30 @@ class Slots(unittest.TestCase):
     def test_indices_are_odd_for_roots_even_for_bridges(self):
         self.assertEqual([s["index"] for s in self.sl], list(range(1, 12)))
 
-    def test_generation_order_is_roots_then_bridges(self):
+    def test_generation_order_interleaves_bridges_after_their_roots(self):
         order = cp.generation_order(self.sl)
         self.assertEqual([s["index"] for s in order],
-                         [1, 3, 5, 7, 9, 11, 2, 4, 6, 8, 10])
+                         [1, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10])
+
+    def test_generation_order_thirteen_chunks(self):
+        # The user-facing example: 13 chunks run as
+        # 1, 3, 2(bridge 1-3), 5, 4(bridge 3-5), 7, 6, 9, 8, 11, 10,
+        # 13, 12(bridge 11-13).
+        g = cp.geometry(1900, 192, 39)
+        self.assertEqual(g["n_odd"], 7)
+        order = cp.generation_order(cp.slots(0, g))
+        self.assertEqual([s["index"] for s in order],
+                         [1, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12])
+
+    def test_generation_order_never_bridges_before_both_roots(self):
+        g = cp.geometry(1900, 192, 39)
+        order = cp.generation_order(cp.slots(0, g))
+        seen = set()
+        for s in order:
+            if s["role"] == "bridge":
+                self.assertIn(s["left"], seen)
+                self.assertIn(s["right"], seen)
+            seen.add(s["raw_start"])
 
 
 class Plan(unittest.TestCase):
@@ -124,7 +144,17 @@ class Plan(unittest.TestCase):
         self.assertEqual(p["next"]["index"], 3)
         self.assertEqual(p["next"]["raw_start"], 306)
 
-    def test_roots_are_generated_before_any_bridge(self):
+    def test_bridge_is_next_once_its_two_roots_exist(self):
+        # Interleaved order: roots 1 and 3 filled -> bridge 2 runs next,
+        # long before the later roots are generated.
+        roots = [entry("R%d" % j, at=j * 192, anchor=j * 306)
+                 for j in range(2)]
+        p = self._plan(roots, 2 * 192)
+        self.assertEqual(p["next"]["index"], 2)
+        self.assertEqual(p["next"]["role"], "bridge")
+        self.assertEqual(p["next"]["raw_start"], 153)
+
+    def test_all_roots_filled_still_bridges_in_order(self):
         roots = [entry("R%d" % j, at=j * 192, anchor=j * 306)
                  for j in range(6)]
         p = self._plan(roots, 6 * 192)
@@ -184,55 +214,61 @@ class TimelineEmit(unittest.TestCase):
 
     def test_root_carries_no_pin_and_a_forced_audio_slot(self):
         na = importlib.import_module("obvpm_tl_test.nodes_assemble")
-        specs, length, _, _, _, status = self._emit(
+        specs, length, _, _, _, root, status = self._emit(
             na.H3Timeline(), [], 0, chunk_plan=True)
         self.assertEqual(length, 192)
         self.assertEqual(len(specs), 1)          # the audio marker only
         self.assertTrue(specs[0]["forced"])
         self.assertEqual(specs[0]["raw_start"], 0)
+        self.assertIs(root, True)                # chunk 1: a root
         self.assertIn("chunk 1 (root)", status)
 
     def test_second_root_forces_the_next_stride_slot(self):
         na = importlib.import_module("obvpm_tl_test.nodes_assemble")
-        specs, _, _, _, _, status = self._emit(
+        specs, _, _, _, _, root, status = self._emit(
             na.H3Timeline(), [entry("A", anchor=0)], 192, chunk_plan=True)
         self.assertEqual(specs[0]["raw_start"], 306)
+        self.assertIs(root, True)                # chunk 3: still a root
         self.assertIn("chunk 3 (root)", status)
 
     def test_bridge_pins_both_neighbours_and_aligns_by_construction(self):
         na = importlib.import_module("obvpm_tl_test.nodes_assemble")
-        # All six roots exist -> the first bridge is next.
-        roots = [entry("R%d" % j, anchor=j * 306) for j in range(6)]
-        specs, length, _, _, _, status = self._emit(
-            na.H3Timeline(), roots, 6 * 192, chunk_plan=True)
+        # Interleaved order: roots 1 and 3 exist -> bridge 2 is next.
+        roots = [entry("R%d" % j, anchor=j * 306) for j in range(2)]
+        specs, length, _, _, _, root, status = self._emit(
+            na.H3Timeline(), roots, 2 * 192, chunk_plan=True)
         self.assertEqual(length, 192)
         self.assertEqual(len(specs), 3)          # extend + prepend + audio
         self.assertNotIn("forced", specs[-1])
         # Left tail at 192-39=153 and right head at 306-(192-39)=153:
         # the two pins agree, so the bridge audio is exact.
         self.assertEqual(specs[-1]["raw_start"], 153)
+        self.assertIs(root, False)               # chunk 2: a bridge
         self.assertIn("chunk 2 (bridge)", status)
 
     def test_plan_mode_ignores_a_manual_pin(self):
         na = importlib.import_module("obvpm_tl_test.nodes_assemble")
         manual = json.dumps({"role": "extend", "source": "A", "window": "39"})
-        specs, _, _, _, _, status = self._emit(
+        specs, _, _, _, _, root, status = self._emit(
             na.H3Timeline(), [], 0, chunk_plan=True, pin_state=manual)
         self.assertEqual(len(specs), 1)
+        self.assertIs(root, True)
         self.assertIn("chunk 1 (root)", status)
 
     def test_plan_off_leaves_the_old_outputs_untouched(self):
         na = importlib.import_module("obvpm_tl_test.nodes_assemble")
         out = self._emit(na.H3Timeline(), [], 0)
-        self.assertEqual(out[5], "")             # plan_status empty
+        self.assertIs(out[5], True)              # unplanned: root-like
+        self.assertEqual(out[6], "")             # plan_status empty
         self.assertNotIn("forced", out[0][-1])
 
     def test_upscale_skips_the_plan(self):
         na = importlib.import_module("obvpm_tl_test.nodes_assemble")
-        specs, _, _, up, audio, status = self._emit(
+        specs, _, _, up, audio, root, status = self._emit(
             na.H3Timeline(), [], 0, chunk_plan=True, upscaling=True)
         self.assertTrue(up)
         self.assertIsNone(audio)
+        self.assertIs(root, True)                # upscale: no planned chunk
         self.assertEqual(status, "")
 
 

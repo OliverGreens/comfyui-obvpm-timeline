@@ -3289,8 +3289,9 @@ app.registerExtension({
             // Odd-first generation: the `chunk_plan` BOOLEAN. While it
             // is on, Run walks chunkplan.py's schedule by itself -- the
             // odd chunks (1, 3, 5...) are independent ROOT generations
-            // first, then the even chunks bridge the gaps one pass each
-            // -- and the manual pin row goes quiet. Same toolbar
+            // and the even chunks bridge the gaps one pass each, run
+            // interleaved right after the root that completes their
+            // pair -- and the manual pin row goes quiet. Same toolbar
             // treatment as upscale: the widget hides, a fixed-label
             // button carries the state in its fill. The fill is the
             // PIN purple, not the upscale teal: the plan is a pin (it
@@ -3322,15 +3323,15 @@ app.registerExtension({
                 chunkPlanBtn.style.color = on ? "#fff" : P.text;
                 chunkPlanBtn.title = on
                     ? "ON: Run follows the chunk plan -- the odd chunks "
-                      + "(1, 3, 5...) are generated first as independent "
-                      + "root takes, then the even chunks bridge the "
-                      + "gaps in one pass each, so every frame is "
-                      + "sampled exactly once. The plan owns the pin: "
-                      + "prepend/extend go quiet while it is on. Click "
-                      + "to generate the normal way."
+                      + "(1, 3, 5...) are independent root takes and the "
+                      + "even chunks bridge the gaps in one pass each, "
+                      + "run interleaved: 1, 3, 2, 5, 4, 7, 6... so every "
+                      + "frame is sampled exactly once. The plan owns the "
+                      + "pin: prepend/extend go quiet while it is on. "
+                      + "Click to generate the normal way."
                     : "OFF: Run generates the next take from the pin "
                       + "below. Click to plan the whole soundtrack "
-                      + "instead: roots first, bridges second.";
+                      + "instead: roots and bridges, interleaved.";
             }
             chunkPlanBtn.addEventListener("mouseenter", () => {
                 chunkPlanBtn.style.background = chunkPlanMode()
@@ -3492,11 +3493,18 @@ app.registerExtension({
                 }
                 const clipAt = new Map();     // raw_start -> clip
                 for (const [clip, a] of anchorOf) clipAt.set(a, clip);
+                // chunkplan.generation_order: root 1, root 2, bridge 2,
+                // root 3, bridge 4, ... -- each bridge right after the
+                // root that completes its pair
+                const order = [roots[0]];
+                for (let j = 1; j < roots.length; j++) {
+                    order.push(roots[j], bridges[j - 1]);
+                }
                 let next = null;
-                for (const s of roots.concat(bridges)) {
+                for (const s of order) {
                     if (!filled.has(s.raw_start)) { next = s; break; }
                 }
-                const done = roots.concat(bridges)
+                const done = order
                     .filter((s) => filled.has(s.raw_start)).length;
                 return { C, W, L, S, nOdd, base, roots, bridges, filled,
                          next, done, anchorOf, clipAt, gap: C - 2 * W,
@@ -8696,10 +8704,49 @@ app.registerExtension({
                         && !node.outputs.some(o => o.name === "chunk_audio")) {
                     node.addOutput("chunk_audio", "AUDIO");
                 }
-                // ...and the plan_status string that followed it.
+                // ...then the root_generation BOOLEAN that followed it...
                 if (node.outputs?.length === 5
+                        && !node.outputs.some(o => o.name === "root_generation")
+                        && !node.outputs.some(o => o.name === "chunk_number")) {
+                    node.addOutput("root_generation", "BOOLEAN");
+                }
+                // ...and the plan_status string that followed that.
+                if (node.outputs?.length === 6
                         && !node.outputs.some(o => o.name === "plan_status")) {
                     node.addOutput("plan_status", "STRING");
+                }
+                // A graph saved between revisions has plan_status where
+                // root_generation now sits: splice the BOOLEAN in before
+                // it and bump plan_status's own links down one slot, so
+                // neither socket's existing wiring receives the other's
+                // value.
+                const outs = node.outputs;
+                const ps = outs
+                    ? outs.findIndex(o => o.name === "plan_status") : -1;
+                if (ps > 0 && !outs.some(o => o.name === "root_generation")
+                        && !outs.some(o => o.name === "chunk_number")) {
+                    outs.splice(ps, 0, { name: "root_generation",
+                                         type: "BOOLEAN", links: null });
+                    if (Array.isArray(node.__output_links)) {
+                        node.__output_links.splice(ps, 0, null);
+                    }
+                    const moved = outs[ps + 1].links;
+                    const registry = node.graph?.links;
+                    if (moved && registry) {
+                        for (const lid of moved) {
+                            const l = registry[lid];
+                            if (l) l.origin_slot = ps + 1;
+                        }
+                    }
+                }
+                // A graph saved with the brief INT chunk_number revision:
+                // same slot, renamed and retyped in place -- links keep
+                // their index, only the socket's label and type change.
+                for (const o of outs ?? []) {
+                    if (o.name === "chunk_number") {
+                        o.name = "root_generation";
+                        o.type = "BOOLEAN";
+                    }
                 }
                 void refresh();
                 return r;

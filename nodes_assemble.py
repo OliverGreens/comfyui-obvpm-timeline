@@ -911,8 +911,8 @@ class H3Timeline:
 
     CATEGORY = "obvpm/h3"
     FUNCTION = "emit"
-    RETURN_TYPES = (wt.PINSPECS, "INT", "STRING", "BOOLEAN", "AUDIO", "STRING")
-    RETURN_NAMES = ("pin_specs", "length", "sequence", "upscaling", "chunk_audio", "plan_status")
+    RETURN_TYPES = (wt.PINSPECS, "INT", "STRING", "BOOLEAN", "AUDIO", "BOOLEAN", "STRING")
+    RETURN_NAMES = ("pin_specs", "length", "sequence", "upscaling", "chunk_audio", "root_generation", "plan_status")
     OUTPUT_TOOLTIPS = (
         "Pin spec for the clip pinned in the timeline widget (extend/"
         "prepend), plus the custom audio track when set. Wire to H3MCtxApplyPins "
@@ -936,12 +936,20 @@ class H3Timeline:
         "head/tail and bridge overlaps, before VAE encoding. Feed to ASR and "
         "use its transcript in the video prompt. None without custom audio "
         "or in upscale mode. Wire length to the generation latent so they agree.",
+        "True when this run generates a ROOT -- an independent first-pass "
+        "generation (the plan's odd chunks 1, 3, 5...) -- and also when no "
+        "chunk is planned at all (plan off, upscale mode, or the plan is "
+        "complete), which is an ordinary root-like take. False when this "
+        "run generates a BRIDGE -- the one-pass gap filler pinned by both "
+        "neighbours (the even chunks 2, 4, 6...). Wire straight into a "
+        "BOOLEAN gate or a text switch ahead of the prompt: root wording "
+        "on true, bridge wording on false, no math needed.",
         "One line describing the chunk plan and which chunk is next, when "
         "the chunk_plan toggle is on: roots (independent first-pass "
-        "generations) first, then one-pass bridges into the gaps, so every "
-        "frame is sampled exactly once and quality never degrades down a "
-        "chain. Empty when the plan is off. Show it with a ShowText-style "
-        "node to see what each Queue will produce.",
+        "generations) and one-pass bridges interleaved -- 1, 3, 2, 5, 4, "
+        "7, 6... -- so every frame is sampled exactly once and quality "
+        "never degrades down a chain. Empty when the plan is off. Show it "
+        "with a ShowText-style node to see what each Queue will produce.",
     )
     DESCRIPTION = (
         "Timeline editor for composed clips: seam-aware blocks, "
@@ -1180,9 +1188,11 @@ class H3Timeline:
                                "On: the manual pin is ignored and every Run "
                                "generates the NEXT chunk of a plan computed "
                                "from the soundtrack length -- the odd chunks "
-                               "(1, 3, 5, ...) first as independent roots, "
-                               "then one-pass bridges (2, 4, ...) into the "
-                               "gaps, each pinned by both neighbours. Every "
+                               "(1, 3, 5, ...) are independent roots and the "
+                               "even chunks (2, 4, ...) one-pass bridges "
+                               "into the gaps, run interleaved: 1, 3, 2, 5, "
+                               "4, 7, 6..., each bridge right after the "
+                               "root that completes its pair. Every "
                                "frame is then sampled exactly once, so "
                                "quality cannot drift down an extend chain. "
                                "Add each take with '+ add to timeline'; the "
@@ -1433,7 +1443,14 @@ class H3Timeline:
                                                  forced_start=forced_start)
                 specs = list(specs) + [audio_spec]
                 audio = audio_spec["audio"]
-            return (specs, length, sequence, upscaling, audio,
+            # The role of the chunk this run generates: True = ROOT (an
+            # odd chunk, or no planned chunk at all -- plan off, upscale,
+            # or plan complete, which is an ordinary root-like take),
+            # False = BRIDGE (an even chunk, the one-pass gap filler).
+            root_generation = (plan_info is None
+                               or plan_info["next"] is None
+                               or plan_info["next"]["role"] == "root")
+            return (specs, length, sequence, upscaling, audio, root_generation,
                     plan_info["status"] if plan_info is not None else "")
 
         _LOG.info("obvpm.h3: timeline run: %s; %s",
