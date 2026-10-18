@@ -131,7 +131,7 @@ def load_verified_bundle(clip):
 
 
 def _create_pins(bundle, clip, create_pins, pin_window, at_frame=None,
-                 pin_mode="masked", mask_shape=None):
+                 pin_mode="masked", mask_shape=None, guide_window=None):
     """`at_frame` = the timeline CUT to continue from, in delivered frames.
 
     None means the clip's own edge (its tail for an extend, its head for
@@ -216,11 +216,17 @@ def _create_pins(bundle, clip, create_pins, pin_window, at_frame=None,
         take_from_frame=take_from_frame, place=place, place_at_frame=0,
         audio_window=0, mode=pin_mode, mask_ramp_frames=ramp,
         mask_ramp_edge=edge, mask_hold=hold)
+    if guide_window:
+        # The keyframe row of a "both" pin covers only the join-facing
+        # edge of the window (nodes_assemble.arrival_guide_window); the
+        # mask still holds the whole window. Apply slices the row.
+        specs[0]["guide_window"] = int(guide_window)
     return specs
 
 
 def _create_pixel_pins(clip, create_pins, pin_window, at_frame=None,
-                       pin_mode="masked", mask_shape=None):
+                       pin_mode="masked", mask_shape=None,
+                       guide_window=None):
     """The same convenience pin, for a clip with no usable sidecar.
 
     Deliberately does NOT mirror _create_pins' grid-shifting: that exists
@@ -262,6 +268,8 @@ def _create_pixel_pins(clip, create_pins, pin_window, at_frame=None,
         "mask_ramp_frames": int((mask_shape or (0,))[0]),
         "mask_ramp_edge": float((mask_shape or (0, 0.0))[1]),
         "mask_hold": float((mask_shape or (0, 0.0, 0.0))[2]),
+        # edge-only keyframe row for a "both" arrival (see _create_pins)
+        "guide_window": int(guide_window or 0),
     }]
 
 

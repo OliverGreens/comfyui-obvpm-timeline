@@ -25,6 +25,7 @@ And it also supports creating seamless looping videos.
 
 - Added custom-audio conditioning, waveform controls, and the **chunk_audio** output.
 - Added the **chunk plan** toggle, the **bridge window** setting, and the **root_generation** and **plan_status** outputs for drift-free long audio-driven generations. **root_generation** (BOOLEAN) is **true** when the run about to happen is a root (odd chunk — or no plan at all) and **false** when it is a bridge (even chunk), so the prompt can branch on the role with no math.
+- Fixed bridges generating 50–60% slower than roots: the arrival's steering row now covers only the join-facing edge of the bridge window instead of the whole window, so it adds far fewer conditioning tokens to the generation's attention. The mask still holds the whole window — seam exactness is unchanged.
 - Updated the included timeline workflow with audio-to-ASR prompt wiring and generation mode enabled for an empty timeline.
 
 ### 0.1.0 (2026-09-21)

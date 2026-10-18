@@ -397,6 +397,35 @@ PIN_MODE_CHOOSABLE = frozenset({"prepend"})
 BRIDGE_MODES = {"extend": "masked", "prepend": "both"}
 
 
+def arrival_guide_window(window, ramp_frames):
+    """The keyframe row an arriving "both" pin rides: the join-facing
+    edge of the window, not the whole of it.
+
+    The mask half of "both" is free -- it writes the window INTO the
+    target latent, so those rows already sit in the generation's own
+    packed sequence and the model attends them at no extra cost. The
+    keyframe row is the half that costs: core packs it as extra cond
+    tokens into the same joint attention (12 steps at window 39, 27 at
+    90, against a 57-step 192-frame target), and attention is
+    quadratic -- reported 2026-10: plan bridges ran 50-60% slower than
+    roots for exactly this.
+
+    The row's only job is steering ("the rows give the model something
+    to steer toward, the mask makes the arrival exact"), and steering
+    matters where the free content meets the held window: the ramped,
+    re-denoised region plus a little lookahead. The deep window is held
+    at mask 0 in-sequence regardless. So the row covers the smallest
+    ladder window that reaches past the ramp -- 22 frames / 7 steps for
+    the plan's 10-frame ramp, whatever the mask window is. The anchor
+    and the mask are untouched; only the row shrinks.
+    """
+    need = max(int(ramp_frames), 5)
+    for w in sorted(fr.WINDOW_LADDER):
+        if w >= need:
+            return min(w, int(window))
+    return int(window)
+
+
 def _shape_note(shape):
     """Human phrase for a soft mask hold, for the log lines."""
     ramp, edge, hold = shape
@@ -1349,7 +1378,7 @@ class H3Timeline:
         return out
 
     def _specs_for(self, clip, role, window, at_frame, pin_mode="guide",
-                   mask_shape=None):
+                   mask_shape=None, guide_window=None):
         """One side's pin specs, latent-grade if the clip allows it.
 
         The choice is made HERE rather than refused: the timeline lists
@@ -1365,14 +1394,15 @@ class H3Timeline:
             return nodes_load._create_pins(
                 bundle, clip, self._PIN_ROLES[role], window,
                 at_frame=at_frame, pin_mode=pin_mode,
-                mask_shape=mask_shape)
+                mask_shape=mask_shape, guide_window=guide_window)
         _LOG.info("obvpm.h3: %s has no usable mctx sidecar; pinning it "
                   "through the PIXEL route (encoded at run time, "
                   "pixel-grade continuity, and the new take will be a "
                   "root)", clip)
         return nodes_load._create_pixel_pins(
             clip, self._PIN_ROLES[role], window, at_frame=at_frame,
-            pin_mode=pin_mode, mask_shape=mask_shape)
+            pin_mode=pin_mode, mask_shape=mask_shape,
+            guide_window=guide_window)
 
     @staticmethod
     def _run_length(seconds, masks):
@@ -1483,18 +1513,24 @@ class H3Timeline:
             # masked departing the left clip; the arriving side is
             # whatever mode2 says -- see PIN_MODE_FOR_ROLE
             arrive = state["mode2"]
+            # A "both" arrival rides the edge-only guide row too: the
+            # deep window is mask-held in-sequence either way.
+            guide = (arrival_guide_window(state["window"], shape[0])
+                     if arrive == "both" else None)
             specs = (self._specs_for(state["source"], "extend",
                                      state["window"], state.get("cut"),
                                      BRIDGE_MODES["extend"]) +
                      self._specs_for(state["source2"], "prepend",
                                      state["window"], state.get("cut2"),
-                                     arrive, mask_shape=shape))
+                                     arrive, mask_shape=shape,
+                                     guide_window=guide))
             _LOG.info("obvpm.h3: timeline pins a BRIDGE: extends %s (%s) "
-                      "+ prepends into %s (%s%s), window %s",
+                      "+ prepends into %s (%s%s), window %s%s",
                       state["source"], BRIDGE_MODES["extend"],
                       state["source2"], arrive,
                       _shape_note(shape) if shaped else "",
-                      state["window"])
+                      state["window"],
+                      "" if guide is None else ", guide row %d frames" % guide)
             return result(specs)
         specs = self._specs_for(state["source"], state["role"],
                                 state["window"], state.get("cut"),
@@ -1541,14 +1577,17 @@ class H3Timeline:
                 "root takes first." % (nxt["index"], nxt["left"],
                                        nxt["right"]))
         window = str(plan_info["window"])
+        guide = arrival_guide_window(plan_info["window"], 10)
         specs = (self._specs_for(left, "extend", window, None,
                                  BRIDGE_MODES["extend"]) +
                  self._specs_for(right, "prepend", window, None,
                                  BRIDGE_MODES["prepend"],
-                                 mask_shape=(10, 0.40, 0.0)))
+                                 mask_shape=(10, 0.40, 0.0),
+                                 guide_window=guide))
         _LOG.info("obvpm.h3: chunk plan: BRIDGE chunk %d between %s and %s, "
-                  "%d frames, window %s (masked extend + both arrival)",
-                  nxt["index"], left, right, nxt["frames"], window)
+                  "%d frames, window %s (masked extend + both arrival, "
+                  "guide row edge-only: %d frames)",
+                  nxt["index"], left, right, nxt["frames"], window, guide)
         return result(specs)
 
 

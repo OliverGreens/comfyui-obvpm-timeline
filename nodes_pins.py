@@ -225,7 +225,11 @@ class H3MCtxPinSpec:
                                "mask makes the arrival exact. They agree "
                                "by construction (one slice, one source), "
                                "so they reinforce rather than fight; the "
-                               "cost is the extra cond tokens."}),
+                               "cost is the extra cond tokens. The "
+                                "Timeline's bridges shorten that row to "
+                                "the join-facing edge (the mask still "
+                                "holds the whole window); a hand-built "
+                                "spec here rides the whole window."}),
                 "mask_ramp_frames": ("INT", {
                     "default": 0, "min": 0, "max": 256,
                     "tooltip": "Masked/both only. Softens the hold over "
@@ -589,6 +593,29 @@ def _prepare_clip_pin(i, spec, snap_down, timing_only=False):
                 "H3MCtxApplyPins: %d steps cover %d frames, expected %d. "
                 "Upstream VAE grid change; refusing." % (steps, covered, n))
 
+        # A "both" pin may ride an edge-only keyframe row (guide_window):
+        # the mask still holds the WHOLE window, but the steering row
+        # covers only the join-facing edge -- the ramp the model is
+        # allowed to move, plus a little lookahead. The deep window sits
+        # in the target's own sequence at mask 0 either way, so a row
+        # across it would be pure attention cost (core packs keyframes
+        # into the same joint attention as the target; reported
+        # 2026-10: full-window rows made plan bridges 50-60% slower
+        # than roots). Ladder windows are all 17j+5, so a shorter window
+        # cut from the same phase-0 slice starts on the grid too:
+        # after-pins take the slice's head, before-pins its tail.
+        guide_video, guide_steps = None, 0
+        g = int(spec.get("guide_window", 0) or 0)
+        if g and spec.get("mode") == "both" and g < n:
+            guide_steps = fr.steps_for_frames(g)
+            if guide_steps is None:
+                raise ValueError(
+                    "H3MCtxApplyPins: spec %d's guide window %d is not a "
+                    "whole latent window." % (i, g))
+            k_g = (k if spec.get("place") == "after"
+                   else k + steps - guide_steps)
+            guide_video = video[:1, :, k_g:k_g + guide_steps].clone()
+
         # Audio: end-aligned with the video window's END, boundaries on
         # the cumulative grid, never converted deltas.
         a_frames = int(spec.get("audio_window", 0)) or n
@@ -620,6 +647,8 @@ def _prepare_clip_pin(i, spec, snap_down, timing_only=False):
             "place": spec.get("place", "before"),
             "video": video_slice,
             "steps": steps,
+            "guide_video": guide_video,
+            "guide_steps": guide_steps,
             "covered": covered,
             "audio": audio_slice,
             "audio_steps": rt,
@@ -892,9 +921,14 @@ class H3MCtxApplyPins:
             place = pin.get("place")
             covered = int(pin["covered"])
             base = 0 if place == "before" else frame_count - covered
+            # The row is the edge slice when the spec asked for one
+            # (guide_window), the whole window otherwise. The ANCHOR is
+            # the window's own base either way: the row covers
+            # [base, base+guide) -- the join-facing edge.
+            row = pin.get("guide_video")
             keyframes.append({
                 "resolved_frame_index": base,
-                "latent": pin["video"],
+                "latent": pin["video"] if row is None else row,
             })
             if origin:
                 keyframes[-1]["origin"] = origin
@@ -934,13 +968,17 @@ class H3MCtxApplyPins:
             _LOG.info(
                 "obvpm.h3: pinned %d frames (%d steps) at the %s of a %d "
                 "frame clip at %dx%d (indices %d..%d); audio %s; trim %d "
-                "off the %s",
+                "off the %s%s",
                 covered, int(pin["steps"]),
                 "head" if place == "before" else "tail",
                 frame_count, width, height, base, base + covered - 1,
                 ("%d steps ending at frame %.3f" % (rt, end_frame))
                 if pin_audio is not None else "off", covered,
-                "head" if place == "before" else "tail")
+                "head" if place == "before" else "tail",
+                "" if not pin.get("guide_steps") else
+                "; guide row edge-only: %d frames (%d steps)"
+                % (fr.pixel_frames(int(pin["guide_steps"])),
+                   int(pin["guide_steps"])))
 
         if n_before and n_after:
             _LOG.info(

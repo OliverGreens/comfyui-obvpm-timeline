@@ -74,6 +74,18 @@ role: root wording on true, bridge wording on false, no math needed.
 **plan_status** (a STRING output) describes the plan and
 names the next chunk; connect it to any text display.
 
+Why a bridge used to cost more, and what changed: the arrival is steered
+by a keyframe row — the trained-in signal that tells the model what it
+must reach. Core packs that row into the *same* attention as the clip
+being generated, so a row spanning the whole window adds a whole window
+of extra conditioning tokens, and attention is quadratic: this is why
+bridges were reported running 50–60% slower than roots. The row now
+covers only the **join-facing edge** of the window — the ramped region
+the model may move, plus a little lookahead (22 frames) — whatever the
+bridge window is. The mask still holds the whole window, so the arrival
+is exactly as exact; the deep frames already sit inside the target's own
+sequence, and the bridge runs at near-root speed.
+
 The Timeline's video **duration** is the chunk length (snapped to the
 shared audio-video grid; it must exceed twice the **bridge window**, 39 or
 90 frames). Roots step forward by a fixed stride, and each saved take

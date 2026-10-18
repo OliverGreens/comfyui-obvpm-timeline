@@ -194,15 +194,19 @@ class TimelineEmit(unittest.TestCase):
     def _emit(self, timeline, entries, total, **kw):
         na = importlib.import_module("obvpm_tl_test.nodes_assemble")
 
-        def specs_for(clip, role, window, cut, mode, mask_shape=None):
-            return [{"source_kind": "clip", "source": {
+        def specs_for(clip, role, window, cut, mode, mask_shape=None,
+                      guide_window=None):
+            spec = {"source_kind": "clip", "source": {
                 "self_id": clip,
                 "video_latent": torch.zeros(1, 24, fr.frames_to_latents(192), 2, 2),
                 "audio_latent": torch.zeros(1, 32, 2, fr.audio_total(192)),
                 "meta": {"raw_frames": 192, "delivered_frames": 192}},
                 "take_from": "tail" if role == "extend" else "head",
                 "place": "before" if role == "extend" else "after",
-                "requested_window": int(window)}]
+                "requested_window": int(window)}
+            if guide_window:
+                spec["guide_window"] = guide_window
+            return [spec]
 
         with patch.object(ta, "track_id", return_value="track"), \
              patch.object(ta, "load_audio", return_value=self.SOURCE), \
@@ -245,6 +249,10 @@ class TimelineEmit(unittest.TestCase):
         self.assertEqual(specs[-1]["raw_start"], 153)
         self.assertIs(root, False)               # chunk 2: a bridge
         self.assertIn("chunk 2 (bridge)", status)
+        # The arrival pin rides an edge-only guide row: the 10-frame
+        # ramp plus lookahead, not the whole 39-frame window.
+        self.assertEqual(specs[1]["guide_window"], 22)
+        self.assertNotIn("guide_window", specs[0])  # masked extend: no row
 
     def test_plan_mode_ignores_a_manual_pin(self):
         na = importlib.import_module("obvpm_tl_test.nodes_assemble")

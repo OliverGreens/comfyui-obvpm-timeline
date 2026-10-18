@@ -211,6 +211,14 @@ Pins are **appended** to any keyframe anchors already on the
 conditioning, so combinations like extend-toward-image (a before-pin
 plus a stock last-frame keyframe) are legal.
 
+**Edge-only guide rows.** A `both` pin's keyframe row costs attention:
+core packs it into the same sequence as the generated clip. The
+Timeline's bridges therefore shorten the row to the **join-facing edge**
+of the window (22 frames — the mask's ramp plus lookahead), whatever the
+mask window is; the mask still holds the whole window, so the arrival is
+unchanged, and the bridge runs at near-root speed instead of 50–60%
+slower. A hand-built `H3MCtxPinSpec` rides the whole window as before.
+
 **Pins from clips with no sidecar.** When a spec names a file instead of
 carrying latents (`source_kind: clip_pixels` — what the Timeline emits
 for imported footage), Apply decodes just the pinned window out of that
