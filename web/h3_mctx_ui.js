@@ -1854,6 +1854,49 @@ const TL_UPSCALE_HOVER = "rgba(38,132,144,0.95)";
 // unwired, the Timeline stays outside execution.
 const TL_REGISTRY = new Map();
 
+// ---- who is running a chunk plan by themselves? -------------------------
+// A Timeline whose **auto chunk plan** is armed registers here. The Result
+// Preview asks it before spending seconds building a smart-cut preview: a
+// take the loop is about to accept on the user's behalf, with nobody
+// watching it, does not need a picture rendered for an audience of none.
+// The loop still gets its payload (that IS how it learns what to add);
+// only the build is skipped.
+const AUTO_LOOPS = new Set();
+function autoClaims(d) {
+    for (const l of AUTO_LOOPS) {
+        try {
+            if (l.claims(d)) return true;
+        } catch (err) { /* a node that went away mid-loop */ }
+    }
+    return false;
+}
+
+// Every Timeline keeps a snapshot of its loop here, armed or not, for
+// `obvpmAutoDiag()` in the console. A loop that stopped halfway through a
+// plan stopped for ONE of a handful of reasons -- it never saw the take,
+// it saw one it refused, it placed one the plan did not count, or the plan
+// really did run out -- and those four look identical from the strip.
+// Print the state instead of guessing at it.
+const AUTO_LIVE = new Map();
+globalThis.obvpmAutoDiag = function obvpmAutoDiag() {
+    const out = [...AUTO_LIVE.values()].map((snap) => {
+        try {
+            return snap();
+        } catch (err) {
+            return { error: String(err) };
+        }
+    });
+    console.table(out.map((s) => ({
+        node: s.node, armed: s.armed, folder: s.folder,
+        done: s.plan?.done, total: s.plan?.total,
+        next: s.plan?.next ? s.plan.next.role + " " + s.plan.next.index : null,
+        plan_error: s.plan?.error ?? null, takes: (s.takes ?? []).length,
+        skipped: (s.skipped ?? []).length, note: s.note,
+    })));
+    console.log(out);
+    return out;
+};
+
 // Dormant, like DEBUG above: flip on when hunting timeline bugs. The
 // call sites stay -- they are the map of where past bugs lived.
 const TL_DEBUG = false;
@@ -2656,6 +2699,51 @@ async function tlFetchClipList() {
     return info?.[TL_PICKER_CLASS]?.input?.required?.clip?.[0] ?? [];
 }
 
+// ---- where an auto take lands -------------------------------------------
+// Where an auto-placed take goes, from what the TAKE says it is.
+// "linked"  -> the lineage placement ("+ add to timeline"): it aims at
+//              its parents and fills the hole between them.
+// "root"    -> the plan's landing: past the last root, with a
+//              bridge-sized hole left behind it for the bridge to fill.
+// A take's own relation is the authority ("bridges", or "extends"/
+// "prepends" when only one pin was recorded); the plan's role only
+// breaks the tie for a take that arrived with no lineage at all -- and
+// the plan being a step behind is exactly why the take wins.
+function autoLanding(relation, planRole) {
+    return relation !== "" || planRole === "bridge" ? "linked" : "root";
+}
+
+// ---- the auto chunk plan gate -------------------------------------------
+// Pure on purpose: this is the whole answer to "why is that button greyed
+// out?", and it can be tested without a ComfyUI graph in the room. It
+// takes what the strip already knows -- the two Run modes and the
+// client's mirror of the plan -- and says either the reason the loop
+// cannot run or null (= go).
+//
+// The order is the order of the questions a user asks: is a Run even a
+// generation? is there a schedule to run? can the schedule be read? is
+// there anything left in it?
+function tlAutoBlocked({ upscale, plan }) {
+    if (upscale) {
+        return "upscaling is on, so a Run refines this whole timeline as "
+            + "one piece instead of generating chunks. Switch upscale off "
+            + "to run the plan by itself.";
+    }
+    if (!plan) {
+        return "the chunk plan is off, so there is no schedule to run. "
+            + "Click \"chunk plan\" first: it plans the soundtrack, this "
+            + "button then generates the whole plan in one click.";
+    }
+    if (plan.pending) return "reading the soundtrack…";
+    if (plan.error) return "the plan cannot be read: " + plan.error;
+    if (!plan.next) {
+        return "the plan is complete -- every chunk of it already has a "
+            + "take on the timeline. Switch chunk plan off to generate "
+            + "freely again.";
+    }
+    return null;
+}
+
 app.registerExtension({
     name: "obvpm.h3_mctx_timeline",
     async beforeRegisterNodeDef(nodeType, nodeData) {
@@ -3275,6 +3363,17 @@ app.registerExtension({
                 const prevRm = runModeWidget.callback;
                 runModeWidget.callback = function (...args) {
                     const r = prevRm?.apply(this, args);
+                    // upscale takes Runs away from generation, so a loop
+                    // that kept queueing would be refining the timeline
+                    // over and over. Guarded: the callback can fire while
+                    // the node is still being built.
+                    try {
+                        if (autoOn) {
+                            stopAuto(upscaleMode()
+                                ? "upscaling was switched on."
+                                : "the Run mode was changed mid-run.");
+                        }
+                    } catch (err) { /* not yet */ }
                     paintRunMode();
                     node.setDirtyCanvas?.(true, true);
                     // guarded: the widget can fire before the strip
@@ -3353,6 +3452,19 @@ app.registerExtension({
                     // left over from a plan that no longer owns the next
                     // run would describe a run that will not happen
                     if (!chunkPlanMode()) planPreview = false;
+                    // A loop with no plan left to run has nothing left to
+                    // queue: stop it rather than let it run one more,
+                    // unplanned, chunk. Guarded like the refresh below:
+                    // a widget callback can fire while the node is still
+                    // being put together, before the corner button -- and
+                    // the loop state -- exists.
+                    try {
+                        if (autoOn) {
+                            stopAuto(chunkPlanMode()
+                                ? "the chunk plan was changed mid-run."
+                                : "the chunk plan was switched off.");
+                        }
+                    } catch (err) { /* not yet */ }
                     paintChunkPlan();
                     node.setDirtyCanvas?.(true, true);
                     // the strip describes the plan everywhere: badges,
@@ -3561,6 +3673,547 @@ app.registerExtension({
                          plan: true };
             }
 
+            // ---- auto chunk plan (the widget's bottom-right corner) ----
+            // The plan already says what the NEXT run is; a Queue says
+            // run it; the Result Preview then asks, take by take, whether
+            // this one is good enough to keep. For a plan the answer is
+            // known in advance -- the run either filled a slot of the
+            // schedule or it did not -- so the corner button answers on
+            // the user's behalf and keeps going: queue the chunk, put the
+            // take the run saved straight into the sequence, queue the
+            // next, until the plan is complete. One click, then the loop
+            // runs itself.
+            //
+            // It answers ONLY while the plan owns the next run: chunk
+            // plan on, upscale off, and a chunk actually left. Greyed
+            // otherwise (tlAutoBlocked), like the loop button when
+            // nothing closes the ring -- and the tooltip says which of
+            // those to change rather than just refusing.
+            //
+            // Deliberately session state, never saved with the workflow:
+            // a loop that resumed on load would queue a generation the
+            // moment somebody opened the graph.
+            const autoBtn = mkBtn("auto chunk plan", "");
+            Object.assign(autoBtn.style, {
+                position: "absolute", right: "4px", bottom: "3px",
+                zIndex: "12", minWidth: "112px",
+                font: "11px/16px sans-serif",
+            });
+            let autoOn = false;        // the loop is armed
+            let autoStop = false;      // stop once the chunk in flight lands
+            let autoRunId = null;      // prompt id of the run we started
+            let autoQueued = false;    // queued, its run not seen yet
+            let autoQueuedAt = 0;      // when that queue happened, for the
+                                       // empty-queue backstop below
+            let autoTakes = [];        // {clip, relation} the run reported
+            let autoSkipped = [];      // takes it refused (folder mismatch)
+            let autoNote = "";         // the last thing it decided
+            // Does this take belong to this timeline? The same folder rule
+            // the Result Preview uses to find the timeline that owns a
+            // clip -- plus the run being ours, which is what makes it
+            // safe: we only ever look at takes during a run we queued.
+            function autoOwns(clip) {
+                const f = folderValue();
+                if (!f) return true;              // unscoped: everything's
+                const c = String(clip || "");
+                const cf = c.includes("/")
+                    ? c.slice(0, c.lastIndexOf("/")) : "";
+                return cf === f;
+            }
+            const autoLoop = { claims: (d) => autoOwns(d?.clip) };
+            function autoPlan() { return chunkPlanMode() ? lastPlan : null; }
+            function autoToast(detail, severity) {
+                try {
+                    app.extensionManager?.toast?.add?.({
+                        severity: severity ?? "info",
+                        summary: "Auto Chunk Plan",
+                        detail, life: severity === "success" ? 10000 : 6000,
+                    });
+                } catch (err) { /* toast API absent */ }
+            }
+            function paintAuto() {
+                const P = themePalette();   // PAL is in its TDZ at build
+                const why = tlAutoBlocked({
+                    upscale: upscaleMode(), plan: autoPlan(),
+                });
+                const p = autoPlan();
+                if (autoOn) {
+                    // The ACCEPT green, not the plan purple: what this
+                    // button is doing, over and over, is pressing "+ add
+                    // to timeline" so the user does not have to.
+                    autoBtn.textContent = autoStop
+                        ? "auto · stopping"
+                        : "auto ▸ " + (p ? (p.done ?? 0) + "/" + (p.total ?? 0)
+                                         : "…");
+                    autoBtn.style.background = "#2e7d4f";
+                    autoBtn.style.borderColor = "#1f5c38";
+                    autoBtn.style.color = "#f0f6f1";
+                    autoBtn.style.opacity = "1";
+                    autoBtn.style.cursor = "pointer";
+                    autoBtn.title = "RUNNING: each Run's take goes straight "
+                        + "into the timeline and the next chunk of the plan "
+                        + "is queued on its own -- no preview to watch, no "
+                        + "button to press between chunks. Stops when the "
+                        + "plan is complete, when a run fails, or when you "
+                        + "click here. "
+                        + (autoRunId != null
+                            ? "A chunk is generating now: clicking stops the "
+                              + "loop AFTER it (that take is still added)."
+                            : "Waiting for the next chunk to start.")
+                        + (autoNote ? "\nLast: " + autoNote : "");
+                } else if (why) {
+                    // What the loop ENDED with stays on the button, not
+                    // just in a toast that outlives nobody: after a run
+                    // measured in minutes "why did it stop" has to be
+                    // answerable from the node, hours later.
+                    const p2 = autoPlan();
+                    const finished = p2 && !p2.next && !p2.error
+                        && !p2.pending;
+                    autoBtn.textContent = finished
+                        ? "auto ✓ " + (p2.done ?? 0) + "/" + (p2.total ?? 0)
+                        : autoNote ? "auto ✗ stopped" : "auto chunk plan";
+                    autoBtn.style.background = P.rest;
+                    autoBtn.style.borderColor = P.edge;
+                    autoBtn.style.color = P.text;
+                    autoBtn.style.opacity = "0.4";
+                    autoBtn.style.cursor = "default";
+                    autoBtn.title = why
+                        + (autoNote ? "\nLast run: " + autoNote : "");
+                } else {
+                    autoBtn.textContent = "auto chunk plan";
+                    autoBtn.style.background = P.rest;
+                    autoBtn.style.borderColor = P.edge;
+                    autoBtn.style.color = P.text;
+                    autoBtn.style.opacity = "1";
+                    autoBtn.style.cursor = "pointer";
+                    autoBtn.title = "Click once and the whole plan runs "
+                        + "itself: chunk " + p.next.index + " ("
+                        + p.next.role + ") is queued now, its take lands in "
+                        + "the timeline as soon as the run saves it, and the "
+                        + "next chunk is queued -- until all "
+                        + (p.total ?? 0) + " chunks are placed ("
+                        + (p.done ?? 0) + " already are). The Result "
+                        + "Preview is skipped for these takes: nothing is "
+                        + "watched between chunks. Click again to stop after "
+                        + "the chunk in flight.";
+                }
+            }
+            autoBtn.addEventListener("mouseenter", () => {
+                if (!autoOn && tlAutoBlocked({
+                    upscale: upscaleMode(), plan: autoPlan(),
+                })) return;
+                autoBtn.style.background = autoOn
+                    ? "#379461" : "rgba(127,127,127,0.3)";
+            });
+            autoBtn.addEventListener("mouseleave", paintAuto);
+            function stopAuto(reason) {
+                autoOn = false;
+                autoStop = false;
+                autoRunId = null;
+                autoQueued = false;
+                autoTakes = [];
+                autoSkipped = [];
+                AUTO_LOOPS.delete(autoLoop);
+                autoNote = reason;
+                // The toast is the answer to "why did it stop?", and it
+                // is easy to miss mid-generation: keep the same sentence
+                // in the console, where it can be read after the fact.
+                console.warn("[obvpm h3] auto chunk plan stopped:", reason);
+                paintAuto();
+                // A plan that ran out of chunks is the SUCCESS case, and
+                // after a run measured in minutes a plain info toast is
+                // the easiest thing in the world to miss.
+                autoToast(reason, /^chunk plan complete/.test(reason)
+                    ? "success" : "info");
+            }
+            async function queueAutoChunk() {
+                const p = autoPlan();
+                if (!p?.next) {
+                    stopAuto("the plan has no chunk left to generate.");
+                    return;
+                }
+                autoTakes = [];
+                autoSkipped = [];
+                autoQueued = true;
+                autoQueuedAt = Date.now();
+                paintAuto();
+                console.info("[obvpm h3] auto chunk plan: queueing "
+                    + p.next.role + " chunk " + p.next.index + " ("
+                    + p.next.frames + " frames), " + (p.done ?? 0) + " of "
+                    + (p.total ?? 0) + " placed");
+                try {
+                    if (typeof app.queuePrompt !== "function") {
+                        throw new Error("this ComfyUI build exposes no "
+                            + "queuePrompt to queue a run from a node");
+                    }
+                    // -1: to the BACK of the queue, like the Run button.
+                    // The loop only ever queues when its own run is over,
+                    // so it never jumps anything else in the queue.
+                    await app.queuePrompt(-1, 1);
+                } catch (err) {
+                    stopAuto("could not queue the next chunk: "
+                        + String(err?.message ?? err));
+                }
+            }
+            async function startAuto() {
+                autoOn = true;
+                autoStop = false;
+                autoTakes = [];
+                autoSkipped = [];
+                autoRunId = null;
+                autoQueued = false;
+                AUTO_LOOPS.add(autoLoop);
+                const p = autoPlan();
+                autoNote = p?.next
+                    ? "queued " + p.next.role + " chunk " + p.next.index
+                    : "";
+                paintAuto();
+                autoToast("Running the chunk plan: "
+                    + (p?.total ?? 0) + " chunks, "
+                    + (p?.done ?? 0) + " already placed. Each take goes "
+                    + "straight into the timeline; click the button again "
+                    + "to stop after the chunk in flight.");
+                await queueAutoChunk();
+            }
+            // The take the run saved. Roots carry no pin at all, so they
+            // land where "+ add" puts a planned root -- past the last one,
+            // with a hole exactly one undelivered bridge wide between
+            // them. A bridge take goes through the lineage-aimed offer
+            // instead, which drops it into its hole between its two roots
+            // and reconciles the parent's cut. Same two placements the
+            // strip would use if the user had pressed "+ add to timeline".
+            async function placeAutoTake(clip, relation, planRole) {
+                if (lastEntries.some((e) => e.clip === clip)) {
+                    autoNote = clip.split("/").pop() + " was already in the "
+                        + "timeline";
+                    return false;
+                }
+                const was = seqWidget.value;
+                const name = clip.split("/").pop();
+                // WHAT LANDS WHERE is decided by the take, not by what the
+                // plan thought it would get: the payload says "bridges"
+                // (or extends/prepends for a take that only recorded one
+                // pin), and a take with lineage goes where "+ add" would
+                // put it -- into the hole, against its parents. A plain
+                // take is a root: it goes past the last root with a
+                // bridge-sized hole behind it. The plan's role is only a
+                // tiebreaker for a take that arrived with no lineage at
+                // all, which is a sidecar that could not be read.
+                const linked = autoLanding(relation, planRole) === "linked";
+                if (linked) {
+                    try {
+                        const r = await TL_REGISTRY.get(node.id)
+                            .offer(clip, null);
+                        autoNote = name + " (" + (relation || "no lineage")
+                            + "): " + r;
+                    } catch (err) {
+                        // A failed lineage placement is not a failed
+                        // chunk: the take exists on disk and the plan has
+                        // a hole of exactly its length. Letting the
+                        // exception end the loop would strand the plan
+                        // with a bridge already generated and not used.
+                        autoNote = name + ": lineage placement failed ("
+                            + String(err?.message ?? err) + ")";
+                        console.warn("[obvpm h3] auto chunk plan: " + autoNote
+                            + " -- filling the plan's hole instead");
+                    }
+                } else {
+                    addClipToSequence(clip);
+                    autoNote = "added " + name + " as the next root";
+                }
+                if (seqWidget.value === was) {
+                    // The placement reported something and changed NOTHING
+                    // on the strip. A bridge take is the case where the
+                    // lineage aim can come back empty (its two parents live
+                    // in the pins recipe, not in relation/parent_id, and a
+                    // sidecar that failed to read has neither), and a loop
+                    // that trusts the message rather than the sequence
+                    // would end a plan with a chunk still owed. So check
+                    // the thing that matters -- the sequence -- and fall
+                    // back to the plan's geometry, stated here rather than
+                    // borrowed from "+ add" (which asks the PLAN what to do,
+                    // and the plan may be the thing that is behind): a take
+                    // with lineage fills the first hole on the strip, which
+                    // is exactly its length.
+                    console.warn("[obvpm h3] auto chunk plan: " + autoNote
+                        + " -- but the sequence did not change; placing it "
+                        + "by the plan's geometry instead");
+                    if (linked) {
+                        const es = tlParseSequence(seqWidget.value);
+                        const at = entryLines();
+                        const gi = es.findIndex((e) => e.gap != null);
+                        if (gi >= 0) {
+                            const lines = currentLines();
+                            lines[at[gi]] = clip;
+                            setSequence(lines.join("\n"));
+                            autoNote = name + ": filled the plan's hole";
+                        }
+                    }
+                    if (seqWidget.value === was) {
+                        addClipToSequence(clip);
+                        autoNote = name + ": added where the plan lands a "
+                            + "take of its kind";
+                    }
+                    if (seqWidget.value === was) {
+                        autoNote = name + ": the sequence did not change at "
+                            + "all";
+                        return false;
+                    }
+                }
+                return true;
+            }
+            async function finishAutoRun() {
+                const p0 = autoPlan();
+                const before = p0?.done ?? 0;
+                // The slot the plan was pointing at BEFORE this run. A
+                // plan that moved is progress even if the count did not
+                // change, so the guard does not depend on one reading.
+                const beforeSlot = p0?.next?.raw_start ?? null;
+                const role = p0?.next?.role ?? null;
+                const takes = autoTakes;
+                const skipped = autoSkipped;
+                autoTakes = [];
+                autoSkipped = [];
+                autoRunId = null;
+                autoQueued = false;
+                console.info("[obvpm h3] auto chunk plan: run over -- "
+                    + takes.length + " take(s)"
+                    + (takes.length
+                        ? " [" + takes.map((t) => t.clip + " ("
+                            + (t.relation || "root") + ")").join(", ") + "]"
+                        : "")
+                    + (skipped.length
+                        ? ", refused [" + skipped.join(", ") + "]" : "")
+                    + "; the plan was pointing at "
+                    + (role ?? "?") + " " + (p0?.next?.index ?? "?"));
+                if (!takes.length) {
+                    stopAuto("the run finished but reported no take this "
+                        + "timeline would accept"
+                        + (folderValue()
+                            ? " (its base_folder is \"" + folderValue()
+                              + "\"; " : " (its base_folder is empty; ")
+                        + (skipped.length
+                            ? "it saw " + skipped.join(", ") + ")"
+                            : "nothing was reported)")
+                        + ". A Result Preview must be wired to the Save "
+                        + "node's path, and the Timeline's base_folder "
+                        + "must be the folder those takes are saved to "
+                        + "(the same rule \"+ add to timeline\" uses).");
+                    return;
+                }
+                let placed = 0;
+                for (const t of takes) {
+                    try {
+                        if (await placeAutoTake(t.clip, t.relation, role)) {
+                            placed += 1;
+                        }
+                    } catch (err) {
+                        autoNote = "could not add " + t.clip + ": "
+                            + String(err?.message ?? err);
+                    }
+                }
+                if (!placed) {
+                    stopAuto("nothing new to place: " + autoNote);
+                    return;
+                }
+                // The plan is read back from the timeline itself (saved
+                // audio anchors), so this is the same check the strip
+                // makes -- and the loop's own proof of progress.
+                await refresh();
+                let p = autoPlan();
+                const moved = (q) => (q?.done ?? 0) > before
+                    || (beforeSlot != null
+                        && (q?.next?.raw_start ?? null) !== beforeSlot);
+                if (!moved(p)) {
+                    // A refresh started after ours can still be in flight
+                    // (the soundtrack probe re-arms one), and a refresh
+                    // that has been superseded returns without publishing
+                    // a plan. One more turn before concluding the plan did
+                    // not move -- stopping on a false reading would strand
+                    // a plan with chunks still owed.
+                    await new Promise((r) => setTimeout(r, 400));
+                    await refresh();
+                    p = autoPlan();
+                }
+                paintAuto();
+                console.info("[obvpm h3] auto chunk plan: plan now "
+                    + (p?.done ?? "?") + "/" + (p?.total ?? "?") + ", next "
+                    + (p?.next ? p.next.role + " " + p.next.index : "none")
+                    + (p?.error ? " (error: " + p.error + ")" : "")
+                    + (p?.pending ? " (soundtrack still probing)" : ""));
+                if (!p) { stopAuto("the chunk plan was switched off."); return; }
+                if (p.error) {
+                    stopAuto("the plan cannot be read: " + p.error);
+                    return;
+                }
+                if (autoStop) {
+                    stopAuto("stopped on request: " + (p.done ?? 0) + " of "
+                        + (p.total ?? 0) + " chunks placed.");
+                    return;
+                }
+                if (!moved(p)) {
+                    stopAuto("the take was placed but the plan on the strip "
+                        + "did not move on from chunk "
+                        + (p0?.next?.index ?? "?") + " -- stopping rather "
+                        + "than generating the same chunk again. The strip "
+                        + "reads each take's saved audio anchor from its "
+                        + "sidecar: if its \"chunk plan — next:\" line did "
+                        + "not advance either, the take was not generated "
+                        + "against this Timeline's soundtrack row. "
+                        + autoNote);
+                    return;
+                }
+                if (!p.next) {
+                    stopAuto("chunk plan complete: " + (p.done ?? 0)
+                        + " chunks placed.");
+                    return;
+                }
+                await queueAutoChunk();
+            }
+            // ---- which run was ours? --------------------------------
+            // The events are global, so a run from another open workflow
+            // should not drive this loop. The loop queues exactly one job
+            // and only ever queues when its own run is over, so the next
+            // run to START after we queued is ours -- that is the rule.
+            //
+            // It deliberately does NOT use the Result Preview's queue
+            // probe (rpQueueOwns). That probe answers "does this job
+            // write to <save prefix>", and a save prefix is
+            // base_folder + filename_prefix ("my_project/clip") -- while
+            // what a Timeline knows is its OWN base_folder, which scopes
+            // its clip picker and is very often empty (the folder is
+            // commonly wired onto the Save node instead, and the
+            // Timeline's widget left blank). Asked with "" or with a bare
+            // folder, the probe answers "no" about a run that is
+            // unquestionably ours, and the loop would throw it away.
+            // Ownership of the TAKE is still checked -- by folder, the
+            // same rule "+ add to timeline" uses -- in autoOwns below.
+            const onAutoStart = (e) => {
+                if (!autoOn || autoRunId != null) return;
+                const id = e?.detail?.prompt_id ?? null;
+                if (id == null) return;
+                autoRunId = id;
+                autoQueued = false;
+                paintAuto();
+            };
+            const onAutoExecuted = (e) => {
+                // Not gated on having seen the run's start event: the
+                // take arrived inside the window this loop opened, and
+                // the folder rule is the ownership test. A start event
+                // this client did not hear must not cost the chunk.
+                if (!autoOn) return;
+                const pid = e?.detail?.prompt_id;
+                if (autoRunId != null && pid != null && pid !== autoRunId) {
+                    return;
+                }
+                const d = e?.detail?.output?.h3_result?.[0];
+                if (!d?.clip || d.render === "joint") return;
+                if (!autoOwns(d.clip)) {
+                    // Kept for the message: a loop that stops because the
+                    // take landed OUTSIDE the Timeline's base_folder is a
+                    // wiring question the user can see and fix, but only
+                    // if the two names it compared are printed.
+                    if (!autoSkipped.includes(d.clip)) {
+                        autoSkipped.push(d.clip);
+                    }
+                    return;
+                }
+                if (!autoTakes.some((t) => t.clip === d.clip)) {
+                    autoTakes.push({ clip: d.clip,
+                        relation: d.relation ?? "" });
+                    console.info("[obvpm h3] auto chunk plan: claimed "
+                        + d.clip + " (" + (d.relation || "root") + ")");
+                }
+            };
+            const onAutoSuccess = (e) => {
+                if (!autoOn || autoRunId == null) return;
+                const id = e?.detail?.prompt_id ?? null;
+                if (id != null && id !== autoRunId) return;
+                void finishAutoRun();
+            };
+            const onAutoHalt = (e) => {
+                if (!autoOn || autoRunId == null) return;
+                const id = e?.detail?.prompt_id ?? null;
+                if (id != null && id !== autoRunId) return;
+                const nodeErr = e?.detail?.node_id != null
+                    ? " (node " + e.detail.node_id + ")" : "";
+                const why = e?.detail?.exception_message
+                    ? ": " + String(e.detail.exception_message).slice(0, 160)
+                    : "";
+                stopAuto("the run did not finish" + nodeErr + why
+                    + ". "
+                    + (autoTakes.length ? "Its take was left for you to "
+                        + "review at the Result Preview." : ""));
+            };
+            // Backstop, for the same reason the Result Preview has one:
+            // a run that never announced itself -- a queue entry deleted
+            // before it started, a build whose start event this node did
+            // not hear -- must not leave the loop waiting forever. The
+            // status payload says how much is left to run, so an empty
+            // queue a few seconds after queueing means there is nothing
+            // left that could still be our chunk.
+            const onAutoQueueStatus = (e) => {
+                if (!autoOn || autoRunId != null || !autoQueued) return;
+                if (Date.now() - autoQueuedAt < 5000) return;
+                if (e?.detail?.exec_info?.queue_remaining !== 0) return;
+                void finishAutoRun();
+            };
+            const AUTO_EVENTS = [
+                ["execution_start", onAutoStart],
+                ["executed", onAutoExecuted],
+                ["execution_success", onAutoSuccess],
+                ["execution_error", onAutoHalt],
+                ["execution_interrupted", onAutoHalt],
+                ["status", onAutoQueueStatus],
+            ];
+            for (const [ev, fn] of AUTO_EVENTS) api.addEventListener(ev, fn);
+            // Console: obvpmAutoDiag(). Armed or not -- a loop that broke
+            // halfway is exactly the case worth reading afterwards.
+            AUTO_LIVE.set(node.id, () => ({
+                node: node.id,
+                folder: folderValue(),
+                armed: autoOn, stopping: autoStop,
+                run: autoRunId, queued: autoQueued,
+                takes: autoTakes.map((t) => t.clip + " ("
+                    + (t.relation || "root") + ")"),
+                skipped: autoSkipped.slice(),
+                note: autoNote,
+                plan: lastPlan && {
+                    C: lastPlan.C, W: lastPlan.W, L: lastPlan.L,
+                    S: lastPlan.S, done: lastPlan.done,
+                    total: lastPlan.total,
+                    error: lastPlan.error ?? null,
+                    pending: lastPlan.pending ?? false,
+                    next: lastPlan.next ?? null,
+                    filled: [...(lastPlan.filled ?? [])]
+                        .sort((a, b) => a - b),
+                },
+                sequence: seqWidget.value,
+            }));
+            // Nothing matched a run at all (a build that emits no start
+            // event, a probe that could not answer): the button is then
+            // the way out, and clicking it stops rather than arming.
+            autoBtn.addEventListener("click", () => {
+                if (autoOn) {
+                    if (autoRunId != null) {
+                        autoStop = true;
+                        paintAuto();
+                        autoToast("Stopping after the chunk generating now "
+                            + "-- its take will still be added.");
+                    } else {
+                        stopAuto("stopped: no run of this timeline was in "
+                            + "flight.");
+                    }
+                    return;
+                }
+                if (tlAutoBlocked({
+                    upscale: upscaleMode(), plan: autoPlan(),
+                })) return;
+                void startAuto();
+            });
+            container.appendChild(autoBtn);
+            paintAuto();
+
             // Whether the sequence is a RING, said where it can be seen.
             // The fact still lives in ONE place, the `loop` line of the
             // sequence text: the button reads it to paint and writes it
@@ -3638,7 +4291,14 @@ app.registerExtension({
                 display: "flex", flexWrap: "nowrap", gap: "6px",
                 alignItems: "center", height: "24px",
                 boxSizing: "border-box", overflow: "hidden",
-                padding: "0 2px",
+                // The right end of this row belongs to the auto chunk
+                // plan button, which sits in the widget's bottom-right
+                // corner, level with the row. Nothing here is
+                // right-aligned -- the badge, the duration box and the
+                // pin controls all flow from the left -- so the reserved
+                // room costs the badge its ellipsis first and everything
+                // else after it, at widths this widget is never used at.
+                padding: "0 120px 0 2px",
             });
             // selected-clip info bar: a clip-surfaced BOX (name +
             // frames) with the prepend/extend toggles OUTSIDE it, to
@@ -7381,6 +8041,10 @@ app.registerExtension({
                 // paints from it
                 lastPlan = chunkPlanMode()
                     ? chunkPlanCompute(entries, metas) : null;
+                // The corner button states the plan's progress and greys
+                // itself off the moment the plan stops owning the next
+                // run, so it repaints wherever the plan is recomputed.
+                paintAuto();
                 updateButtons();
                 void probeFull();
 
@@ -8692,6 +9356,13 @@ app.registerExtension({
             const onConfigure = node.onConfigure;
             node.onConfigure = function () {
                 const r = onConfigure?.apply(this, arguments);
+                // Whatever is about to be restored is a different plan,
+                // sequence and folder from the one the loop was armed on.
+                // A loop never survives a load: it would queue a
+                // generation the moment the graph opened.
+                try {
+                    if (autoOn) stopAuto("the workflow was loaded.");
+                } catch (err) { /* not yet */ }
                 // a graph saved while this widget was the run_mode combo
                 // restores "generation"/"upscale"; as a BOOLEAN input
                 // the server would read either string as true
@@ -8759,6 +9430,15 @@ app.registerExtension({
                 rulerRO.disconnect();
                 themeMO.disconnect();
                 TL_REGISTRY.delete(node.id);
+                // a loop dies with its node: no orphan left in AUTO_LOOPS
+                // telling Result Previews to skip their builds, and no
+                // listener queueing runs for a graph that no longer has
+                // this timeline in it.
+                AUTO_LOOPS.delete(autoLoop);
+                AUTO_LIVE.delete(node.id);
+                for (const [ev, fn] of AUTO_EVENTS) {
+                    api.removeEventListener(ev, fn);
+                }
                 dropProgress();
                 for (const v of vids) {
                     v.pause();
@@ -9880,6 +10560,12 @@ function buildResultPreview(node) {
     async function render(d, opts) {
         PAL = themePalette();
         current = d;
+        // A Timeline running its auto chunk plan accepts this take on the
+        // user's behalf, so the decision is already taken: no buttons to
+        // press, and (below) no preview to build. The take still shows --
+        // the strip says what it is and how its joins measured.
+        const auto = autoClaims(d);
+        if (auto) decide();
         const seq = ++reqSeq;
         blockEls = [];
         strip.replaceChildren();
@@ -10027,6 +10713,17 @@ function buildResultPreview(node) {
             strip.appendChild(bEl);
         });
 
+        if (auto) {
+            // Between chunks of an auto plan nobody is watching, so the
+            // smart-cut build that makes the watchable file is skipped --
+            // seconds of ffmpeg per chunk, spent on a picture no one
+            // sees. The strip above still says what landed and how each
+            // join measured, and the timeline itself plays the cut.
+            status.textContent = d.clip.split("/").pop()
+                + " — auto-added to the timeline (no preview built)";
+            node.graph?.setDirtyCanvas(true);
+            return;
+        }
         rpProgress.arm("preparing…");
         try {
             const resp = await api.fetchApi("/obvpm/h3/preview_cut", {

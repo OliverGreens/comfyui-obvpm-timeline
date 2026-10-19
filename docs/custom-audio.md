@@ -113,6 +113,57 @@ it is on the strip shows where each chunk goes:
 - **prepend** and **extend** go grey, because the plan owns the pin, and
   the row under the strip names the next chunk instead of a pin.
 
+### Running the whole plan without stopping
+
+A plan is a schedule of N runs, and each run would otherwise be Queue →
+watch the Result Preview → **+ add to timeline**. The **auto chunk plan**
+button in the Timeline's bottom-right corner does those three for every
+chunk: it queues the next chunk of the plan, places the take the run
+saved exactly where **+ add** would have placed it (a root past the last
+root with a bridge-sized hole between them; a bridge into its hole), and
+queues the next chunk — until the plan is complete.
+
+It is clickable only while the plan owns the next run: **chunk plan** on,
+**upscale** off, and a chunk left to generate. Greyed out otherwise, with
+the reason in its tooltip. While it runs the button counts the plan
+(`auto ▸ 3/9`); clicking it again stops after the chunk in flight — that
+take is still added, nothing further is queued. It also stops on its own
+when the plan completes, when a run fails, when a placed take fills no
+new slot of the plan (rather than generating the same chunk forever), or
+when chunk plan or upscale is switched mid-run. The state is not saved
+with the workflow: a loop that resumed on load would queue a generation
+the moment the graph opened.
+
+Because nobody is watching between chunks, a Result Preview skips the
+preview build for a take the loop is accepting and says so on its status
+line. The take's own seam verdicts are unchanged — they come from its
+sidecar — and the timeline plays the cut. Stop the loop and the review
+step comes back for the next take.
+
+Two wiring facts the loop depends on, both the same ones **+ add to
+timeline** already depends on: a **Result Preview** must be wired to the
+Save node's `path` (that is how the loop learns which take the run
+saved), and the Timeline's **base_folder** must be the folder those takes
+land in — or empty, which means "any folder". If a take lands somewhere
+else, the loop stops after the first chunk and names both the folder it
+expected and the clips it saw.
+
+Each take is placed by **what it reports itself to be**, not by what the
+plan expected: a take whose payload says `bridges` (or `extends` /
+`prepends`, when only one of its two pins was recorded) goes through the
+lineage placement and fills the hole against its parents; a plain take is
+a root and lands past the last root with a hole behind it. If a placement
+reports success but leaves the sequence untouched — or throws — the loop
+places the take by the plan's geometry instead, into the first hole on the
+strip, rather than ending a plan with a chunk already generated and unused.
+
+When the loop ends, the button keeps the answer: `auto ✓ 3/3` when the
+plan ran out of chunks, `auto ✗ stopped` otherwise, last event in its
+tooltip. Every step is in the browser console
+(`[obvpm h3] auto chunk plan: queueing … / claimed … / stopped: …`), and
+`obvpmAutoDiag()` prints one row per Timeline — armed or not — with the
+plan it read, the takes it saw and refused, and the sequence.
+
 Keep the same reference image and a consistent prompt across the roots:
 they are independent generations, and the shared conditioning plus the
 bridge overlaps are what make them read as one continuous take.
