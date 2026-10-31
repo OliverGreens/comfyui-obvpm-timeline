@@ -76,6 +76,45 @@ class Geometry(unittest.TestCase):
         self.assertEqual(cp.audio_frames(track(duration=2.5)), 60)
 
 
+class LastRoot(unittest.TestCase):
+    """The final root is cut to the audio it still has to cover:
+    <5 s left -> 5 s; 5-9 s -> needed+1; >=9 s -> the normal chunk."""
+
+    def test_little_audio_left_generates_a_short_clip(self):
+        # 10 s chunks (C=243, S=408): 2.5 s of audio left past the
+        # previous coverage -> the 5 s floor, snapped to 141 frames.
+        g = cp.geometry(5 * 408 + 60, 243, 39)
+        self.assertEqual(g["n_odd"], 6)
+        self.assertEqual(g["last_root_frames"], 141)
+        roots = [s for s in cp.slots(0, g) if s["role"] == "root"]
+        self.assertEqual([s["frames"] for s in roots],
+                         [243, 243, 243, 243, 243, 141])
+
+    def test_seven_seconds_left_becomes_an_eight_second_clip(self):
+        # The user's example: 7 s of new audio -> generate 8 s (192 f).
+        g = cp.geometry(5 * 408 + 168, 243, 39)
+        self.assertEqual(g["last_root_frames"], 192)
+
+    def test_nine_seconds_left_keeps_the_full_chunk(self):
+        g = cp.geometry(5 * 408 + 216, 243, 39)
+        self.assertEqual(g["last_root_frames"], 243)
+
+    def test_single_short_root_is_floored_to_five_seconds(self):
+        g = cp.geometry(100, 243, 39)
+        self.assertEqual(g["n_odd"], 1)
+        self.assertEqual(g["last_root_frames"], 141)
+
+    def test_the_short_root_always_covers_the_soundtrack(self):
+        for audio in range(1, 1201):
+            for C in (90, 192, 243):
+                g = cp.geometry(audio, C, 39)
+                last = g["last_root_frames"]
+                self.assertLessEqual(last, g["chunk_frames"], (audio, C))
+                self.assertGreaterEqual(last, g["window"], (audio, C))
+                self.assertEqual((last - 39) % 51, 0, (audio, C))
+                self.assertGreaterEqual(g["coverage"], audio, (audio, C))
+
+
 class Slots(unittest.TestCase):
     def setUp(self):
         self.g = cp.geometry(1440, 192, 39)
@@ -94,6 +133,16 @@ class Slots(unittest.TestCase):
 
     def test_indices_are_odd_for_roots_even_for_bridges(self):
         self.assertEqual([s["index"] for s in self.sl], list(range(1, 12)))
+
+    def test_only_the_final_root_is_shortened(self):
+        # 60 s over 8 s chunks: the last root starts at 1530, past the
+        # audio end at 1440 -- it exists to anchor bridge 10, so it
+        # generates the 5 s floor (141 f), not a full 192 f chunk.
+        roots = [s for s in self.sl if s["role"] == "root"]
+        self.assertEqual([s["frames"] for s in roots],
+                         [192, 192, 192, 192, 192, 141])
+        for b in (s for s in self.sl if s["role"] == "bridge"):
+            self.assertEqual(b["frames"], 192)
 
     def test_generation_order_interleaves_bridges_after_their_roots(self):
         order = cp.generation_order(self.sl)
@@ -234,6 +283,21 @@ class TimelineEmit(unittest.TestCase):
         self.assertEqual(specs[0]["raw_start"], 306)
         self.assertIs(root, True)                # chunk 3: still a root
         self.assertIn("chunk 3 (root)", status)
+
+    def test_last_root_generates_the_shortened_length(self):
+        na = importlib.import_module("obvpm_tl_test.nodes_assemble")
+        # Roots 1-5 and bridges 2-8 done: chunk 11 (the last root, at
+        # raw 1530, past the 60 s audio end) generates the short clip.
+        filled = [entry("R%d" % j, anchor=j * 306) for j in range(5)]
+        filled += [entry("B%d" % j, anchor=j * 306 + 153) for j in range(4)]
+        specs, length, _, _, _, root, status = self._emit(
+            na.H3Timeline(), filled, 9 * 192, chunk_plan=True)
+        self.assertEqual(length, 141)
+        self.assertEqual(specs[-1]["raw_start"], 1530)
+        self.assertEqual(specs[-1]["frames"], 141)
+        self.assertIs(root, True)
+        self.assertIn("chunk 11 (root)", status)
+        self.assertIn("last root 5.88 s", status)
 
     def test_bridge_pins_both_neighbours_and_aligns_by_construction(self):
         na = importlib.import_module("obvpm_tl_test.nodes_assemble")

@@ -26,8 +26,14 @@ source_start is C-W), and its after-pin takes the right root's first W
 raw frames (source_start 0); both anchors agree exactly when the right
 root sits S frames after the left one -- which is what the slots encode.
 
-Coverage: (n_odd - 1)*S + C >= audio frames, so the last root may run
-past the end of the soundtrack (silence-padded, trimmed at export).
+Coverage: (n_odd - 1)*S + C >= audio frames. The LAST root, though, is
+cut to the audio it actually has to cover instead of a full chunk:
+needed = audio - (n_odd-1)*S frames (its first W frames are the bridge's
+motion context, already inside that count), plus one second of headroom,
+floored at 5 s and capped at C -- under 5 s of audio left generate 5 s,
+5-9 s generate needed+1, 9 s and up generate the normal chunk. The
+shortened root still carries the W head frames its bridge's after-pin
+takes, and coverage never drops below the end of the soundtrack.
 
 Generation ORDER interleaves the two roles: root 1, root 2, bridge 2,
 then root 3, bridge 4, root 4, bridge 6, ... -- each bridge runs as soon
@@ -71,6 +77,30 @@ def audio_frames(track):
     return int(round(seconds * fr.FPS))
 
 
+def last_root_frames(needed, C, window):
+    """Length of the FINAL root: only the audio it still has to cover.
+
+    ``needed`` is the audio from the last root's slot to the end of the
+    soundtrack -- the root's first W frames are the bridge's motion
+    context and already inside that count. Generating a full chunk there
+    samples silence, so: under 5 s left generate 5 s; up to 9 s generate
+    one second more than needed; past that the normal chunk. The result
+    stays on the shared AV grid, never uncovers the soundtrack, never
+    drops below the window its bridge's after-pin takes, and never
+    exceeds the normal chunk length.
+    """
+    from . import nodes_masked
+    if needed >= 9 * fr.FPS:
+        return C
+    target = 5 * fr.FPS if needed < 5 * fr.FPS else needed + fr.FPS
+    last = int(nodes_masked.shared_av_snap_nearest(target))
+    lo = nodes_masked.shared_av_snap_down(needed)
+    floor = (nodes_masked.SHARED_AV_GRID_BASE if lo is None
+             else lo if lo >= needed
+             else lo + nodes_masked.SHARED_AV_GRID_STEP)
+    return min(max(last, floor, window), C)
+
+
 def geometry(audio_len, chunk_frames, window):
     """Slot sizes and counts for one soundtrack; pure, no I/O."""
     from . import nodes_masked
@@ -88,20 +118,30 @@ def geometry(audio_len, chunk_frames, window):
     L = C
     S = C + L - 2 * window
     n_odd = 1 if audio_len <= C else -(-(audio_len - C) // S) + 1
+    last = last_root_frames(audio_len - (n_odd - 1) * S, C, window)
     return {"audio_frames": int(audio_len), "chunk_frames": C,
             "bridge_frames": L, "window": window, "stride": S,
             "n_odd": n_odd, "n_runs": 2 * n_odd - 1,
-            "coverage": (n_odd - 1) * S + C}
+            "last_root_frames": last,
+            "coverage": (n_odd - 1) * S + last}
 
 
 def slots(base, g):
-    """Every slot in the plan, in timeline order (odd, even, odd, ...)."""
+    """Every slot in the plan, in timeline order (odd, even, odd, ...).
+
+    The final root is the short one (see last_root_frames): it generates
+    only the audio it still has to cover, not a full chunk of silence.
+    Its raw_start and audio anchor are unchanged, so the bridge before
+    it -- which takes just its first W frames -- aligns exactly the same.
+    """
     C, L, W, S, n = (g["chunk_frames"], g["bridge_frames"], g["window"],
                      g["stride"], g["n_odd"])
+    last = g.get("last_root_frames", C)
     out = []
     for j in range(n):
         out.append({"index": 2 * j + 1, "role": "root",
-                    "raw_start": base + j * S, "frames": C})
+                    "raw_start": base + j * S,
+                    "frames": last if j == n - 1 else C})
     for j in range(n - 1):
         out.append({"index": 2 * j + 2, "role": "bridge",
                     "raw_start": base + j * S + C - W, "frames": L,
@@ -153,6 +193,8 @@ def _status(g, nxt, done, base):
                g["chunk_frames"] / float(fr.FPS),
                g["bridge_frames"] / float(fr.FPS),
                g["window"] / float(fr.FPS), done, g["n_runs"]))
+    if g.get("last_root_frames", g["chunk_frames"]) < g["chunk_frames"]:
+        head += ", last root %.2f s" % (g["last_root_frames"] / float(fr.FPS))
     if nxt is None:
         return head + "; plan complete -- further runs append past the plan"
     lo, hi = _seconds(nxt["raw_start"], base, nxt["frames"])
