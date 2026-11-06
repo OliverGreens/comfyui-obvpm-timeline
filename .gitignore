@@ -8,3 +8,23 @@ private/
 
 # cygwin/git-bash crash dumps -- land wherever the shell was cwd'd
 *.stackdump
+
+# scratch the suite leaves behind: test temp dirs (their Windows ACLs also
+# make them unreadable, which is what the "could not open directory"
+# warnings during any git command here are) and the pytest cache
+.tmp-test/
+.tmp_test/
+.pytest_cache/
+
+# one-off probes and the output they captured, kept out of tests/
+tests/_*
+
+# example footage kept beside the workflows for local A/B; tens of MB of
+# video does not belong in git
+vid_examples/
+
+# editor / rebuild backups of workflow JSONs: the .json is the artifact
+*.bak
+
+# tooling leftovers (Windows ACL repair logs)
+.acl-recovery/
